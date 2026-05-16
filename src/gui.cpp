@@ -211,6 +211,24 @@ static int uiMouseY(int y)
     return (int)(y / UI_SCALE);
 }
 
+static void clearPendingInputEvents(void)
+{
+    while (MouseHit()) {
+        GetMouseMsg();
+    }
+    while ((GetAsyncKeyState(VK_RETURN) & 0x8000) ||
+        (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
+        Sleep(10);
+    }
+    (void)GetAsyncKeyState(VK_RETURN);
+    (void)GetAsyncKeyState(VK_ESCAPE);
+}
+
+static int keyPressedOnce(int vk)
+{
+    return (GetAsyncKeyState(vk) & 0x0001) != 0;
+}
+
 typedef struct LargeInputState {
     wchar_t *buffer;
     int maxCount;
@@ -266,6 +284,16 @@ static LRESULT CALLBACK largeInputProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         SetBkColor((HDC)wParam, RGB(255, 255, 255));
         SetTextColor((HDC)wParam, RGB(15, 23, 42));
         return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    if (msg == WM_KEYDOWN && state != NULL) {
+        if (wParam == VK_RETURN) {
+            SendMessage(hwnd, WM_COMMAND, IDOK, 0);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            SendMessage(hwnd, WM_COMMAND, IDCANCEL, 0);
+            return 0;
+        }
     }
     if (msg == WM_COMMAND && state != NULL) {
         int id = LOWORD(wParam);
@@ -345,6 +373,16 @@ static bool runScaledInputBox(wchar_t *buffer, int maxCount,
 
     while (!state.done && GetMessage(&msg, NULL, 0, 0) > 0) {
         if (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) {
+            if (msg.message == WM_KEYDOWN) {
+                if (msg.wParam == VK_RETURN) {
+                    SendMessage(hwnd, WM_COMMAND, IDOK, 0);
+                    continue;
+                }
+                if (msg.wParam == VK_ESCAPE) {
+                    SendMessage(hwnd, WM_COMMAND, IDCANCEL, 0);
+                    continue;
+                }
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         } else if (msg.message < WM_MOUSEFIRST || msg.message > WM_MOUSELAST) {
@@ -353,6 +391,7 @@ static bool runScaledInputBox(wchar_t *buffer, int maxCount,
         }
     }
     SetForegroundWindow(parent);
+    clearPendingInputEvents();
     return state.ok != 0;
 }
 
@@ -466,6 +505,16 @@ static LRESULT CALLBACK largeMessageProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         SetTextColor((HDC)wParam, RGB(15, 23, 42));
         return (LRESULT)GetStockObject(WHITE_BRUSH);
     }
+    if (msg == WM_KEYDOWN && state != NULL) {
+        if (wParam == VK_RETURN) {
+            SendMessage(hwnd, WM_COMMAND, IDOK, 0);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            SendMessage(hwnd, WM_COMMAND, IDCANCEL, 0);
+            return 0;
+        }
+    }
     if (msg == WM_COMMAND && state != NULL) {
         int id = LOWORD(wParam);
         if (id == IDOK || id == IDCANCEL) {
@@ -555,6 +604,16 @@ static int runScaledMessageBox(const wchar_t *text, const wchar_t *title, UINT t
 
     while (!state.done && GetMessage(&msg, NULL, 0, 0) > 0) {
         if (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) {
+            if (msg.message == WM_KEYDOWN) {
+                if (msg.wParam == VK_RETURN) {
+                    SendMessage(hwnd, WM_COMMAND, IDOK, 0);
+                    continue;
+                }
+                if (msg.wParam == VK_ESCAPE) {
+                    SendMessage(hwnd, WM_COMMAND, IDCANCEL, 0);
+                    continue;
+                }
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         } else if (msg.message < WM_MOUSEFIRST || msg.message > WM_MOUSELAST) {
@@ -565,6 +624,7 @@ static int runScaledMessageBox(const wchar_t *text, const wchar_t *title, UINT t
     if (parent != NULL) {
         SetForegroundWindow(parent);
     }
+    clearPendingInputEvents();
     return state.result;
 }
 
@@ -656,6 +716,15 @@ static int validateFormField(const FormField *field, wchar_t *msg, int msgSize)
     return 1;
 }
 
+static int validateFormFields(FormField fields[], int count, wchar_t *msg, int msgSize)
+{
+    int i;
+    for (i = 0; i < count; i++) {
+        if (!validateFormField(&fields[i], msg, msgSize)) return 0;
+    }
+    return 1;
+}
+
 static void drawFormFields(const wchar_t *title, const wchar_t *note, FormField fields[], int count)
 {
     int i;
@@ -729,8 +798,17 @@ static int runForm(const wchar_t *title, const wchar_t *note, FormField fields[]
         {360, 500, 500, 550, L"", 201},
         {560, 500, 700, 550, L"", 202}
     };
+    clearPendingInputEvents();
     drawFormFields(title, note, fields, count);
     while (1) {
+        if (keyPressedOnce(VK_RETURN)) {
+            wchar_t msgText[256];
+            if (validateFormFields(fields, count, msgText, 256)) return 1;
+            message(msgText);
+            drawFormFields(title, note, fields, count);
+        } else if (keyPressedOnce(VK_ESCAPE)) {
+            return 0;
+        }
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
@@ -750,16 +828,10 @@ static int runForm(const wchar_t *title, const wchar_t *note, FormField fields[]
                     }
                     drawFormFields(title, note, fields, count);
                 } else if (action == 201) {
-                    int i;
                     wchar_t msgText[256];
-                    for (i = 0; i < count; i++) {
-                        if (!validateFormField(&fields[i], msgText, 256)) {
-                            message(msgText);
-                            drawFormFields(title, note, fields, count);
-                            break;
-                        }
-                    }
-                    if (i == count) return 1;
+                    if (validateFormFields(fields, count, msgText, 256)) return 1;
+                    message(msgText);
+                    drawFormFields(title, note, fields, count);
                 } else if (action == 202) {
                     return 0;
                 }
@@ -816,8 +888,14 @@ static int runPromptInput(const wchar_t *title, const char *promptText,
         {560, 500, 700, 550, L"", 202}
     };
     RECT boxRect = {320, 456, 910, 512};
+    clearPendingInputEvents();
     drawPromptInputForm(title, promptText, label, hint, out);
     while (1) {
+        if (keyPressedOnce(VK_RETURN)) {
+            return 1;
+        } else if (keyPressedOnce(VK_ESCAPE)) {
+            return 0;
+        }
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
@@ -920,8 +998,17 @@ static int runPromptForm(const wchar_t *title, const char *promptText, FormField
         {360, 500, 500, 550, L"", 201},
         {560, 500, 700, 550, L"", 202}
     };
+    clearPendingInputEvents();
     drawPromptForm(title, promptText, fields, count);
     while (1) {
+        if (keyPressedOnce(VK_RETURN)) {
+            wchar_t msgText[256];
+            if (validateFormFields(fields, count, msgText, 256)) return 1;
+            message(msgText);
+            drawPromptForm(title, promptText, fields, count);
+        } else if (keyPressedOnce(VK_ESCAPE)) {
+            return 0;
+        }
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
@@ -939,16 +1026,10 @@ static int runPromptForm(const wchar_t *title, const char *promptText, FormField
                     }
                     drawPromptForm(title, promptText, fields, count);
                 } else if (action == 201) {
-                    int i;
                     wchar_t msgText[256];
-                    for (i = 0; i < count; i++) {
-                        if (!validateFormField(&fields[i], msgText, 256)) {
-                            message(msgText);
-                            drawPromptForm(title, promptText, fields, count);
-                            break;
-                        }
-                    }
-                    if (i == count) return 1;
+                    if (validateFormFields(fields, count, msgText, 256)) return 1;
+                    message(msgText);
+                    drawPromptForm(title, promptText, fields, count);
                 } else if (action == 202) {
                     return 0;
                 }
@@ -992,8 +1073,19 @@ static int runPatientNameInput(char *name, int nameSize)
     };
     RECT boxRect = {400, 250, 850, 315};
     clearText(name, nameSize);
+    clearPendingInputEvents();
     drawPatientNameInput(name);
     while (1) {
+        if (keyPressedOnce(VK_RETURN)) {
+            if (!checkName(name)) {
+                message(L"患者姓名不符合限制：2-20位，不能包含 | 或换行");
+                drawPatientNameInput(name);
+            } else {
+                return 1;
+            }
+        } else if (keyPressedOnce(VK_ESCAPE)) {
+            return 0;
+        }
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
@@ -1202,10 +1294,23 @@ static void extractChoiceItems(const char *choices, int maxChoice,
     }
 }
 
+static int choiceStartY(const std::string &header)
+{
+    return header.empty() ? 154 : 204;
+}
+
 static int choiceItemsPerPage(const std::string &header)
 {
-    (void)header;
-    return 4;
+    return header.empty() ? 4 : 3;
+}
+
+static void choiceItemRect(const std::string &header, int row, RECT *r)
+{
+    int y1 = choiceStartY(header) + row * 84;
+    r->left = 105;
+    r->top = y1;
+    r->right = 955;
+    r->bottom = y1 + 82;
 }
 
 static void drawChoicePage(const wchar_t *title, const std::vector<std::string> &items,
@@ -1215,7 +1320,6 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
     int start = page * perPage;
     int end = start + perPage;
     int totalPage = ((int)items.size() + perPage - 1) / perPage;
-    int startY = header.empty() ? 160 : 200;
     int i;
     wchar_t pageText[64];
     Button nav[] = {
@@ -1226,16 +1330,16 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
     if (end > (int)items.size()) end = (int)items.size();
     drawTop(title);
     if (!header.empty()) {
-        RECT headerRect = {120, 140, 940, 188};
-        useClearFont(22, FW_SEMIBOLD);
+        RECT headerRect = {105, 132, 955, 196};
+        useClearFont(20, FW_SEMIBOLD);
         settextcolor(RGB(25, 35, 50));
         drawtext(toWide(header.c_str()).c_str(), &headerRect, DT_LEFT | DT_TOP | DT_WORDBREAK);
     }
     setbkmode(TRANSPARENT);
     for (i = start; i < end; i++) {
         int row = i - start;
-        int y1 = startY + row * 72;
-        RECT r = {120, y1, 940, y1 + 60};
+        RECT r;
+        choiceItemRect(header, row, &r);
         setfillcolor(RGB(248, 250, 252));
         setlinecolor(RGB(92, 65, 154));
         setlinestyle(PS_SOLID, 2);
@@ -1243,10 +1347,10 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
         rectangle(r.left, r.top, r.right, r.bottom);
         settextcolor(RGB(15, 23, 42));
         {
-            RECT textRect = {r.left + 18, r.top + 4, r.right - 18, r.bottom - 4};
-            useClearFont(20, FW_SEMIBOLD);
+            RECT textRect = {r.left + 18, r.top + 8, r.right - 18, r.bottom - 8};
+            useClearFont(17, FW_SEMIBOLD);
             drawtext(toWide(items[i].c_str()).c_str(), &textRect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_EDITCONTROL);
         }
     }
     if (totalPage > 1) {
@@ -1269,13 +1373,13 @@ static int hitChoiceItem(int itemCount, const std::string &header, int page, int
     int perPage = choiceItemsPerPage(header);
     int start = page * perPage;
     int end = start + perPage;
-    int startY = header.empty() ? 160 : 200;
     int i;
     if (end > itemCount) end = itemCount;
     for (i = start; i < end; i++) {
         int row = i - start;
-        int y1 = startY + row * 72;
-        if (x >= 120 && x <= 940 && y >= y1 && y <= y1 + 60) return i + 1;
+        RECT r;
+        choiceItemRect(header, row, &r);
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return i + 1;
     }
     return -1;
 }
@@ -1299,8 +1403,12 @@ static int askChoice(const wchar_t *title, const char *choices, int maxChoice, i
     extractChoiceItems(choices, maxChoice, &items, &header);
     perPage = choiceItemsPerPage(header);
     totalPage = (maxChoice + perPage - 1) / perPage;
+    clearPendingInputEvents();
     drawChoicePage(title, items, header, page);
     while (1) {
+        if (keyPressedOnce(VK_ESCAPE)) {
+            return 0;
+        }
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
@@ -1916,6 +2024,8 @@ static Patient *choosePatientForCurrentDoctor(void)
         for (i = 0; i < count; i++) {
             snprintf(line, sizeof(line), "%d. %s  %s  电话：%s  身份证：%s  状态：%s\n",
                 i + 1, list[i]->id, list[i]->name, list[i]->phone, list[i]->cardId, list[i]->status);
+            snprintf(line, sizeof(line), "%d. %s  %s\n电话：%s  身份证：%s\n状态：%s\n",
+                i + 1, list[i]->id, list[i]->name, list[i]->phone, list[i]->cardId, list[i]->status);
             appendText(prompt, sizeof(prompt), line);
         }
         if (!askChoice(L"选择患者", prompt, count, &choice)) return NULL;
@@ -1949,6 +2059,8 @@ static Patient *choosePatient(void)
         appendLine(prompt, sizeof(prompt), "找到多名同名患者，请核对身份证和电话后点击患者按钮：");
         for (i = 0; i < count; i++) {
             snprintf(line, sizeof(line), "%d. %s 身份证：%s 电话：%s\n",
+                i + 1, list[i]->name, list[i]->cardId, list[i]->phone);
+            snprintf(line, sizeof(line), "%d. %s\n身份证：%s  电话：%s\n",
                 i + 1, list[i]->name, list[i]->cardId, list[i]->phone);
             appendText(prompt, sizeof(prompt), line);
         }
@@ -3205,6 +3317,44 @@ static void drawPrescriptionOrderForm(const char *deptId, Medicine *meds[],
     setlinestyle(PS_SOLID, 1);
 }
 
+static int validatePrescriptionOrder(Medicine *meds[], char qtyText[][16],
+    char adviceList[][TEXT_LEN], int counts[], int slotCount, int *itemCount)
+{
+    int i;
+    int count = 0;
+    for (i = 0; i < slotCount; i++) {
+        int value;
+        int j;
+        if (meds[i] == NULL && isBlank(qtyText[i]) && isBlank(adviceList[i])) continue;
+        if (meds[i] == NULL) {
+            message(L"已填写数量或医嘱的行必须先选择药品。");
+            return 0;
+        }
+        if (!parseIntStrict(qtyText[i], &value) || value < 1 || value > 9999) {
+            message(L"药品数量必须是 1-9999 的整数。");
+            return 0;
+        }
+        if (hasBadChar(adviceList[i])) {
+            message(L"用药医嘱不能包含 | 或换行。");
+            return 0;
+        }
+        for (j = 0; j < i; j++) {
+            if (meds[j] != NULL && strcmp(meds[j]->id, meds[i]->id) == 0) {
+                message(L"同一张处方中药品不能重复选择。");
+                return 0;
+            }
+        }
+        counts[i] = value;
+        count++;
+    }
+    if (count == 0) {
+        message(L"请至少填写一行药品和数量。");
+        return 0;
+    }
+    *itemCount = count;
+    return 1;
+}
+
 static int runPrescriptionOrderForm(const char *deptId, Medicine *meds[],
     char qtyText[][16], char adviceList[][TEXT_LEN], int counts[], int slotCount, int *itemCount)
 {
@@ -3219,8 +3369,15 @@ static int runPrescriptionOrderForm(const char *deptId, Medicine *meds[],
         clearText(adviceList[i], TEXT_LEN);
         counts[i] = 0;
     }
+    clearPendingInputEvents();
     drawPrescriptionOrderForm(deptId, meds, qtyText, adviceList, slotCount);
     while (1) {
+        if (keyPressedOnce(VK_RETURN)) {
+            if (validatePrescriptionOrder(meds, qtyText, adviceList, counts, slotCount, itemCount)) return 1;
+            drawPrescriptionOrderForm(deptId, meds, qtyText, adviceList, slotCount);
+        } else if (keyPressedOnce(VK_ESCAPE)) {
+            return 0;
+        }
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
