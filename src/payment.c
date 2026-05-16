@@ -94,7 +94,6 @@ int payPayment(const char *id, const char *date)
     if (p == NULL) return ERR_NOT_FOUND;
     if (!checkDate(date)) return ERR_INPUT;
     if (strcmp(p->status, "已缴费") == 0) return ERR_REPEAT;
-    // 答辩注意：同一笔账单不能重复缴费，避免状态错乱（难度：简单）
     safeCopy(p->status, STATUS_LEN, "已缴费");
     safeCopy(p->date, DATE_LEN, date);
     return OK;
@@ -156,10 +155,64 @@ static int paymentDateInRange(const char *d, const char *begin, const char *end)
     return 1;
 }
 
+static const char *patientPaymentStatusText(Payment *p)
+{
+    if (p == NULL) return "";
+    if (strcmp(p->sourceType, "退费") == 0 && strcmp(p->status, "已缴费") == 0) {
+        return "已退费";
+    }
+    return p->status;
+}
+
+static void collectPatientPaymentSummary(Payment *p, const char *patientId,
+    const char *dateBegin, const char *dateEnd,
+    double *reg, double *exam, double *rx, double *inhosp,
+    double *deposit, double *refund, double *other, double *unpaid, double *paidTotal)
+{
+    while (p != NULL) {
+        if (strcmp(p->patientId, patientId) != 0) {
+            p = p->next;
+            continue;
+        }
+        if ((dateBegin != NULL && !isBlank(dateBegin)) || (dateEnd != NULL && !isBlank(dateEnd))) {
+            if (!paymentDateInRange(p->date, dateBegin, dateEnd)) {
+                p = p->next;
+                continue;
+            }
+        }
+        if (strcmp(p->status, "已缴费") == 0) {
+            if (strcmp(p->sourceType, "挂号") == 0) {
+                *reg += p->amount;
+                *paidTotal += p->amount;
+            } else if (strcmp(p->sourceType, "检查") == 0) {
+                *exam += p->amount;
+                *paidTotal += p->amount;
+            } else if (strcmp(p->sourceType, "处方") == 0) {
+                *rx += p->amount;
+                *paidTotal += p->amount;
+            } else if (strcmp(p->sourceType, "住院") == 0) {
+                *inhosp += p->amount;
+                *paidTotal += p->amount;
+            } else if (strcmp(p->sourceType, "住院押金") == 0) {
+                *deposit += p->amount;
+                *paidTotal += p->amount;
+            } else if (strcmp(p->sourceType, "退费") == 0) {
+                *refund += p->amount;
+            } else {
+                *other += p->amount;
+                *paidTotal += p->amount;
+            }
+        } else {
+            *unpaid += p->amount;
+        }
+        p = p->next;
+    }
+}
+
 void paymentSummaryByPatient(const char *patientId, char *out, int outSize)
 {
     Payment *p = paymentHead;
-    double reg = 0, exam = 0, rx = 0, inhosp = 0, other = 0, unpaid = 0, paidTotal = 0;
+    double reg = 0, exam = 0, rx = 0, inhosp = 0, deposit = 0, refund = 0, other = 0, unpaid = 0, paidTotal = 0;
     char line[LINE_LEN];
     if (patientId == NULL) {
         clearText(out, outSize);
@@ -167,30 +220,8 @@ void paymentSummaryByPatient(const char *patientId, char *out, int outSize)
     }
     clearText(out, outSize);
     appendLine(out, outSize, "费用汇总（按缴费类型，仅统计该患者）");
-    p = paymentHead;
-    while (p != NULL) {
-        if (strcmp(p->patientId, patientId) != 0) {
-            p = p->next;
-            continue;
-        }
-        if (strcmp(p->status, "已缴费") == 0) {
-            paidTotal += p->amount;
-            if (strcmp(p->sourceType, "挂号") == 0) {
-                reg += p->amount;
-            } else if (strcmp(p->sourceType, "检查") == 0) {
-                exam += p->amount;
-            } else if (strcmp(p->sourceType, "处方") == 0) {
-                rx += p->amount;
-            } else if (strcmp(p->sourceType, "住院") == 0) {
-                inhosp += p->amount;
-            } else {
-                other += p->amount;
-            }
-        } else {
-            unpaid += p->amount;
-        }
-        p = p->next;
-    }
+    collectPatientPaymentSummary(p, patientId, NULL, NULL,
+        &reg, &exam, &rx, &inhosp, &deposit, &refund, &other, &unpaid, &paidTotal);
     snprintf(line, sizeof(line), "挂号费合计：%.2f\n", reg);
     appendText(out, outSize, line);
     snprintf(line, sizeof(line), "检查费合计：%.2f\n", exam);
@@ -198,6 +229,10 @@ void paymentSummaryByPatient(const char *patientId, char *out, int outSize)
     snprintf(line, sizeof(line), "药费（处方）合计：%.2f\n", rx);
     appendText(out, outSize, line);
     snprintf(line, sizeof(line), "住院费合计：%.2f\n", inhosp);
+    appendText(out, outSize, line);
+    snprintf(line, sizeof(line), "住院押金合计：%.2f\n", deposit);
+    appendText(out, outSize, line);
+    snprintf(line, sizeof(line), "已退费合计：%.2f\n", refund);
     appendText(out, outSize, line);
     snprintf(line, sizeof(line), "其他缴费合计：%.2f\n", other);
     appendText(out, outSize, line);
@@ -211,7 +246,7 @@ void paymentSummaryByPatientInRange(const char *patientId,
     const char *dateBegin, const char *dateEnd, char *out, int outSize)
 {
     Payment *p = paymentHead;
-    double reg = 0, exam = 0, rx = 0, inhosp = 0, other = 0, unpaid = 0, paidTotal = 0;
+    double reg = 0, exam = 0, rx = 0, inhosp = 0, deposit = 0, refund = 0, other = 0, unpaid = 0, paidTotal = 0;
     char line[LINE_LEN];
     if (patientId == NULL) {
         clearText(out, outSize);
@@ -219,33 +254,8 @@ void paymentSummaryByPatientInRange(const char *patientId,
     }
     clearText(out, outSize);
     appendLine(out, outSize, "费用汇总（按所选日期范围内的缴费）");
-    while (p != NULL) {
-        if (strcmp(p->patientId, patientId) != 0) {
-            p = p->next;
-            continue;
-        }
-        if (!paymentDateInRange(p->date, dateBegin, dateEnd)) {
-            p = p->next;
-            continue;
-        }
-        if (strcmp(p->status, "已缴费") == 0) {
-            paidTotal += p->amount;
-            if (strcmp(p->sourceType, "挂号") == 0) {
-                reg += p->amount;
-            } else if (strcmp(p->sourceType, "检查") == 0) {
-                exam += p->amount;
-            } else if (strcmp(p->sourceType, "处方") == 0) {
-                rx += p->amount;
-            } else if (strcmp(p->sourceType, "住院") == 0) {
-                inhosp += p->amount;
-            } else {
-                other += p->amount;
-            }
-        } else {
-            unpaid += p->amount;
-        }
-        p = p->next;
-    }
+    collectPatientPaymentSummary(p, patientId, dateBegin, dateEnd,
+        &reg, &exam, &rx, &inhosp, &deposit, &refund, &other, &unpaid, &paidTotal);
     snprintf(line, sizeof(line), "挂号费合计：%.2f\n", reg);
     appendText(out, outSize, line);
     snprintf(line, sizeof(line), "检查费合计：%.2f\n", exam);
@@ -253,6 +263,10 @@ void paymentSummaryByPatientInRange(const char *patientId,
     snprintf(line, sizeof(line), "药费（处方）合计：%.2f\n", rx);
     appendText(out, outSize, line);
     snprintf(line, sizeof(line), "住院费合计：%.2f\n", inhosp);
+    appendText(out, outSize, line);
+    snprintf(line, sizeof(line), "住院押金合计：%.2f\n", deposit);
+    appendText(out, outSize, line);
+    snprintf(line, sizeof(line), "已退费合计：%.2f\n", refund);
     appendText(out, outSize, line);
     snprintf(line, sizeof(line), "其他缴费合计：%.2f\n", other);
     appendText(out, outSize, line);
@@ -284,7 +298,7 @@ void listPaymentsByPatientPatientView(const char *patientId,
             continue;
         }
         snprintf(line, sizeof(line), "%s | %.2f | %s | %s | %s\n",
-            p->sourceType, p->amount, p->status, p->date, p->note);
+            p->sourceType, p->amount, patientPaymentStatusText(p), p->date, p->note);
         appendText(out, outSize, line);
         count++;
         p = p->next;

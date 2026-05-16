@@ -851,7 +851,6 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
         int row = i - start;
         int y1 = startY + row * 72;
         RECT r = {120, y1, 940, y1 + 60};
-        int multiline = items[i].find('\n') != std::string::npos || items[i].size() > 52;
         setfillcolor(RGB(248, 250, 252));
         setlinecolor(RGB(92, 65, 154));
         setlinestyle(PS_SOLID, 2);
@@ -860,9 +859,9 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
         settextcolor(RGB(15, 23, 42));
         {
             RECT textRect = {r.left + 18, r.top + 4, r.right - 18, r.bottom - 4};
-            useClearFont(multiline ? 20 : 26, FW_SEMIBOLD);
+            useClearFont(20, FW_SEMIBOLD);
             drawtext(toWide(items[i].c_str()).c_str(), &textRect,
-                DT_LEFT | (multiline ? DT_TOP : DT_VCENTER) | (multiline ? DT_WORDBREAK : DT_SINGLELINE));
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
     }
     if (totalPage > 1) {
@@ -3363,18 +3362,26 @@ static void doLeave(void)
     }
     getCurrentDateTime(timestamp, sizeof(timestamp));
     if (payAmount <= 0) {
+        int refundCode = OK;
+        char refundPayId[ID_LEN];
         makeNextRecordId(recId, sizeof(recId));
         code = addMedicalRecord(recId, patient->id, "", dept ? dept->id : ward->deptId,
             "出院", date, totalFee, "", "出院结算并释放床位（押金已抵扣）", 1);
         if (code == OK) code = releasePatientBed(patient->id);
+        if (code == OK && -balance > 0.0) {
+            makeNextPaymentId(refundPayId, sizeof(refundPayId));
+            refundCode = addPayment(refundPayId, patient->id, "退费", recId, -balance, "已缴费", date, "住院押金退费");
+        }
         snprintf(out, sizeof(out),
             "出院办理完成（押金已覆盖费用）\n患者：%s\n住院天数：%d天\n\n"
             "【费用明细】\n床位费：%.2f元\n护理费：%.2f元\n住院合计：%.2f元\n\n"
-            "【押金信息】\n预交押金：%.2f元\n应退费：%.2f元\n\n"
+            "【押金信息】\n预交押金：%.2f元\n应退费：%.2f元\n%s"
             "结果：%s\n操作时间：%s\n",
             patient->name, days,
             bedFee, nursingTotal, totalFee,
             depositPaid, -balance,
+            (code == OK && refundCode == OK) ? "退费记录：已写入「我的账单」\n\n" :
+            (code == OK ? "退费记录写入失败，请联系管理端核对账单。\n\n" : "\n"),
             codeText(code), timestamp);
         openResult(out);
         return;
