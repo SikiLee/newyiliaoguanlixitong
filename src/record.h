@@ -19,7 +19,9 @@ int countRegisterRecordsByDoctor(const char *doctorId);
 int hasPatientDeptRegisterOnDate(const char *patientId, const char *deptId, const char *date);
 int patientHasVisitOnDate(const char *patientId, const char *date);
 MedicalRecord *findLatestRegisterByPatient(const char *patientId);
+MedicalRecord *findLatestRegisterByPatientDoctor(const char *patientId, const char *doctorId);
 MedicalRecord *findLatestVisitByPatient(const char *patientId);
+MedicalRecord *findLatestVisitByPatientDoctor(const char *patientId, const char *doctorId);
 void listPatientMedicalPatientView(const char *patientId, const char *mode,
     const char *visitSubtype, const char *dateBegin, const char *dateEnd,
     char *out, int outSize);

@@ -197,6 +197,32 @@ MedicalRecord *findLatestRegisterByPatient(const char *patientId)
     return latest;
 }
 
+MedicalRecord *findLatestRegisterByPatientDoctor(const char *patientId, const char *doctorId)
+{
+    MedicalRecord *p = recordHead;
+    MedicalRecord *latest = NULL;
+    int pNum;
+    int latestNum;
+    if (patientId == NULL || doctorId == NULL || isBlank(doctorId)) return NULL;
+    while (p != NULL) {
+        if (strcmp(p->patientId, patientId) == 0 && strcmp(p->doctorId, doctorId) == 0 &&
+            strcmp(p->type, "挂号") == 0 && p->regStatus == 1) {
+            if (latest == NULL) {
+                latest = p;
+            } else {
+                pNum = getIdNumber(p->id, "REC");
+                latestNum = getIdNumber(latest->id, "REC");
+                if (compareDate(p->date, latest->date) > 0 ||
+                    (strcmp(p->date, latest->date) == 0 && pNum >= latestNum)) {
+                    latest = p;
+                }
+            }
+        }
+        p = p->next;
+    }
+    return latest;
+}
+
 MedicalRecord *findLatestVisitByPatient(const char *patientId)
 {
     MedicalRecord *p = recordHead;
@@ -206,6 +232,32 @@ MedicalRecord *findLatestVisitByPatient(const char *patientId)
     if (patientId == NULL) return NULL;
     while (p != NULL) {
         if (strcmp(p->patientId, patientId) == 0 && strcmp(p->type, "看诊") == 0) {
+            if (latest == NULL) {
+                latest = p;
+            } else {
+                pNum = getIdNumber(p->id, "REC");
+                latestNum = getIdNumber(latest->id, "REC");
+                if (compareDate(p->date, latest->date) > 0 ||
+                    (strcmp(p->date, latest->date) == 0 && pNum >= latestNum)) {
+                    latest = p;
+                }
+            }
+        }
+        p = p->next;
+    }
+    return latest;
+}
+
+MedicalRecord *findLatestVisitByPatientDoctor(const char *patientId, const char *doctorId)
+{
+    MedicalRecord *p = recordHead;
+    MedicalRecord *latest = NULL;
+    int pNum;
+    int latestNum;
+    if (patientId == NULL || doctorId == NULL || isBlank(doctorId)) return NULL;
+    while (p != NULL) {
+        if (strcmp(p->patientId, patientId) == 0 && strcmp(p->doctorId, doctorId) == 0 &&
+            strcmp(p->type, "看诊") == 0) {
             if (latest == NULL) {
                 latest = p;
             } else {

@@ -1294,29 +1294,36 @@ static void extractChoiceItems(const char *choices, int maxChoice,
     }
 }
 
-static int choiceStartY(const std::string &header)
+static int isCheckItemChoice(const wchar_t *title)
 {
+    return title != NULL && wcscmp(title, L"检查项目选择") == 0;
+}
+
+static int choiceStartY(const std::string &header, const wchar_t *title)
+{
+    if (isCheckItemChoice(title)) return 204;
     return header.empty() ? 154 : 204;
 }
 
-static int choiceItemsPerPage(const std::string &header)
+static int choiceItemsPerPage(const std::string &header, const wchar_t *title)
 {
+    if (isCheckItemChoice(title)) return 5;
     return header.empty() ? 4 : 3;
 }
 
-static void choiceItemRect(const std::string &header, int row, RECT *r)
+static void choiceItemRect(const std::string &header, const wchar_t *title, int row, RECT *r)
 {
-    int y1 = choiceStartY(header) + row * 84;
+    int y1 = choiceStartY(header, title) + (isCheckItemChoice(title) ? row * 58 : row * 84);
     r->left = 105;
     r->top = y1;
     r->right = 955;
-    r->bottom = y1 + 82;
+    r->bottom = y1 + (isCheckItemChoice(title) ? 52 : 82);
 }
 
 static void drawChoicePage(const wchar_t *title, const std::vector<std::string> &items,
     const std::string &header, int page)
 {
-    int perPage = choiceItemsPerPage(header);
+    int perPage = choiceItemsPerPage(header, title);
     int start = page * perPage;
     int end = start + perPage;
     int totalPage = ((int)items.size() + perPage - 1) / perPage;
@@ -1339,7 +1346,7 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
     for (i = start; i < end; i++) {
         int row = i - start;
         RECT r;
-        choiceItemRect(header, row, &r);
+        choiceItemRect(header, title, row, &r);
         setfillcolor(RGB(248, 250, 252));
         setlinecolor(RGB(92, 65, 154));
         setlinestyle(PS_SOLID, 2);
@@ -1368,9 +1375,9 @@ static void drawChoicePage(const wchar_t *title, const std::vector<std::string> 
     setlinestyle(PS_SOLID, 1);
 }
 
-static int hitChoiceItem(int itemCount, const std::string &header, int page, int x, int y)
+static int hitChoiceItem(int itemCount, const std::string &header, const wchar_t *title, int page, int x, int y)
 {
-    int perPage = choiceItemsPerPage(header);
+    int perPage = choiceItemsPerPage(header, title);
     int start = page * perPage;
     int end = start + perPage;
     int i;
@@ -1378,7 +1385,7 @@ static int hitChoiceItem(int itemCount, const std::string &header, int page, int
     for (i = start; i < end; i++) {
         int row = i - start;
         RECT r;
-        choiceItemRect(header, row, &r);
+        choiceItemRect(header, title, row, &r);
         if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return i + 1;
     }
     return -1;
@@ -1401,7 +1408,7 @@ static int askChoice(const wchar_t *title, const char *choices, int maxChoice, i
     };
     if (maxChoice <= 0) return 0;
     extractChoiceItems(choices, maxChoice, &items, &header);
-    perPage = choiceItemsPerPage(header);
+    perPage = choiceItemsPerPage(header, title);
     totalPage = (maxChoice + perPage - 1) / perPage;
     clearPendingInputEvents();
     drawChoicePage(title, items, header, page);
@@ -1414,7 +1421,7 @@ static int askChoice(const wchar_t *title, const char *choices, int maxChoice, i
             if (msg.uMsg == WM_LBUTTONDOWN) {
                 int mx = uiMouseX(msg.x);
                 int my = uiMouseY(msg.y);
-                int selected = hitChoiceItem(maxChoice, header, page, mx, my);
+                int selected = hitChoiceItem(maxChoice, header, title, page, mx, my);
                 int action = totalPage > 1 ? hit(nav, 3, mx, my) : hit(cancel, 1, mx, my);
                 if (selected >= 1 && selected <= maxChoice) {
                     *choice = selected;
@@ -2185,7 +2192,7 @@ static Doctor *chooseDoctorForRegister(const char *deptId, const char *visitDate
         visitDate, dept ? dept->name : "未知科室");
     appendText(prompt, sizeof(prompt), line);
     while (p != NULL && count < 50) {
-        if (strcmp(p->deptId, deptId) == 0 && doctorWorksOnDate(p, visitDate)) {
+        if (strcmp(p->deptId, deptId) == 0) {
             list[count] = p;
             {
                 int used = countRegisterRecordsByDoctor(p->id);
@@ -2268,7 +2275,10 @@ static int parseCheckBundleNote(const char *note, char *deptId, int deptSize,
 
 static MedicalRecord *ensureActiveRegister(Patient *patient)
 {
-    MedicalRecord *reg = findLatestRegisterByPatient(patient->id);
+    Doctor *loginDoc = currentDoctor();
+    MedicalRecord *reg = loginDoc != NULL ?
+        findLatestRegisterByPatientDoctor(patient->id, loginDoc->id) :
+        findLatestRegisterByPatient(patient->id);
     if (reg != NULL) return reg;
     message(L"该患者没有有效挂号记录（需已挂号状态），请先完成挂号。");
     return NULL;
@@ -2276,8 +2286,13 @@ static MedicalRecord *ensureActiveRegister(Patient *patient)
 
 static MedicalRecord *ensureCurrentVisit(Patient *patient)
 {
-    MedicalRecord *reg = findLatestRegisterByPatient(patient->id);
-    MedicalRecord *visit = findLatestVisitByPatient(patient->id);
+    Doctor *loginDoc = currentDoctor();
+    MedicalRecord *reg = loginDoc != NULL ?
+        findLatestRegisterByPatientDoctor(patient->id, loginDoc->id) :
+        findLatestRegisterByPatient(patient->id);
+    MedicalRecord *visit = loginDoc != NULL ?
+        findLatestVisitByPatientDoctor(patient->id, loginDoc->id) :
+        findLatestVisitByPatient(patient->id);
     if (visit != NULL) {
         if (reg == NULL ||
             compareDate(visit->date, reg->date) > 0 ||
