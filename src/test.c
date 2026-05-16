@@ -19,8 +19,10 @@ static void appendTest(char *out,int outSize,const char *name,const char *input,
 {
     char line[LINE_LEN * 2];
     (void)expect;
-    snprintf(line,sizeof(line),"T%03d | %s | 输入：%s | 输出：%s | %s | 难度：%s\n",
-        testNo,name,input,actual,pass ? "通过" : "失败",level);
+    (void)pass;
+    (void)level;
+    snprintf(line,sizeof(line),"错误操作：%s | 输入范例：%s | 输出结果：%s\n",
+        name,input,actual);
     appendText(out,outSize,line);
     testNo++;
 }

@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <graphics.h>
 #include <string>
 #include <vector>
@@ -23,6 +23,10 @@ extern "C" {
 
 #define WIN_W 1060
 #define WIN_H 620
+#define UI_SCALE 1.30
+#define WINDOW_W ((int)(WIN_W * UI_SCALE))
+#define WINDOW_H ((int)(WIN_H * UI_SCALE))
+#define RESULT_PAGE_SIZE 7
 #define PAGE_HOME 0
 #define PAGE_PATIENT 1
 #define PAGE_MEDICAL 2
@@ -173,22 +177,395 @@ static std::string toUtf8(const wchar_t *s)
     return out;
 }
 
+static int runScaledMessageBox(const wchar_t *text, const wchar_t *title, UINT type);
+static const wchar_t *textOk(void);
+static const wchar_t *textCancel(void);
+static const wchar_t *textTip(void);
+static const wchar_t *textInput(void);
+
 static void message(const wchar_t *text)
 {
-    MessageBox(GetHWnd(), text, L"提示", MB_OK);
+    runScaledMessageBox(text, L"提示", MB_OK);
 }
 
 static void useClearFont(int height, int weight = FW_NORMAL)
 {
     LOGFONT font;
     ZeroMemory(&font, sizeof(font));
-    font.lfHeight = height;
+    font.lfHeight = (LONG)(height * UI_SCALE);
     font.lfWeight = weight;
     font.lfCharSet = DEFAULT_CHARSET;
     font.lfQuality = CLEARTYPE_QUALITY;
     font.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
     wcscpy_s(font.lfFaceName, LF_FACESIZE, L"Microsoft YaHei UI");
     settextstyle(&font);
+}
+
+static int uiMouseX(int x)
+{
+    return (int)(x / UI_SCALE);
+}
+
+static int uiMouseY(int y)
+{
+    return (int)(y / UI_SCALE);
+}
+
+typedef struct LargeInputState {
+    wchar_t *buffer;
+    int maxCount;
+    const wchar_t *prompt;
+    const wchar_t *title;
+    const wchar_t *defaultValue;
+    HWND edit;
+    HFONT textFont;
+    HFONT buttonFont;
+    int done;
+    int ok;
+} LargeInputState;
+
+static HFONT createUiFont(int height, int weight)
+{
+    return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+}
+
+static LRESULT CALLBACK largeInputProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    LargeInputState *state = (LargeInputState *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (msg == WM_CREATE) {
+        CREATESTRUCT *cs = (CREATESTRUCT *)lParam;
+        state = (LargeInputState *)cs->lpCreateParams;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)state);
+        state->textFont = createUiFont(24, FW_NORMAL);
+        state->buttonFont = createUiFont(22, FW_NORMAL);
+        HWND prompt = CreateWindowW(L"STATIC", state->prompt,
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 30, 28, 700, 38,
+            hwnd, NULL, GetModuleHandle(NULL), NULL);
+        state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->defaultValue,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            30, 84, 700, 48, hwnd, (HMENU)101, GetModuleHandle(NULL), NULL);
+        HWND ok = CreateWindowW(L"BUTTON", L"确定",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            430, 168, 130, 48, hwnd, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
+        HWND cancel = CreateWindowW(L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            600, 168, 130, 48, hwnd, (HMENU)IDCANCEL, GetModuleHandle(NULL), NULL);
+        SetWindowTextW(ok, textOk());
+        SetWindowTextW(cancel, textCancel());
+        SendMessage(prompt, WM_SETFONT, (WPARAM)state->textFont, TRUE);
+        SendMessage(state->edit, WM_SETFONT, (WPARAM)state->textFont, TRUE);
+        SendMessage(ok, WM_SETFONT, (WPARAM)state->buttonFont, TRUE);
+        SendMessage(cancel, WM_SETFONT, (WPARAM)state->buttonFont, TRUE);
+        SetFocus(state->edit);
+        SendMessage(state->edit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    if ((msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT) && state != NULL) {
+        SetBkColor((HDC)wParam, RGB(255, 255, 255));
+        SetTextColor((HDC)wParam, RGB(15, 23, 42));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    if (msg == WM_COMMAND && state != NULL) {
+        int id = LOWORD(wParam);
+        if (id == IDOK) {
+            GetWindowTextW(state->edit, state->buffer, state->maxCount);
+            state->ok = 1;
+            state->done = 1;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == IDCANCEL) {
+            state->done = 1;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+    }
+    if (msg == WM_CLOSE && state != NULL) {
+        state->done = 1;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_DESTROY && state != NULL) {
+        if (state->textFont != NULL) DeleteObject(state->textFont);
+        if (state->buttonFont != NULL) DeleteObject(state->buttonFont);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static bool runScaledInputBox(wchar_t *buffer, int maxCount,
+    const wchar_t *prompt, const wchar_t *title, const wchar_t *defaultValue)
+{
+    static int registered = 0;
+    const wchar_t *className = L"HisLargeInputBox";
+    HWND parent = GetHWnd();
+    RECT parentRect;
+    int width = 780;
+    int height = 290;
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    LargeInputState state;
+    HWND hwnd;
+    MSG msg;
+
+    if (!registered) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc = largeInputProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.lpszClassName = className;
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hCursor = LoadCursor(NULL, IDC_IBEAM);
+        wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        if (!RegisterClassW(&wc)) return InputBox(buffer, maxCount, prompt, title, defaultValue, 0, 0, false);
+        registered = 1;
+    }
+
+    ZeroMemory(&state, sizeof(state));
+    state.buffer = buffer;
+    state.maxCount = maxCount;
+    state.prompt = prompt == NULL ? L"" : prompt;
+    state.title = title == NULL ? textInput() : title;
+    state.defaultValue = defaultValue == NULL ? L"" : defaultValue;
+
+    if (parent != NULL && GetWindowRect(parent, &parentRect)) {
+        x = parentRect.left + ((parentRect.right - parentRect.left) - width) / 2;
+        y = parentRect.top + ((parentRect.bottom - parentRect.top) - height) / 2;
+    }
+
+    hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, className, state.title,
+        WS_CAPTION | WS_SYSMENU | WS_VISIBLE, x, y, width, height,
+        parent, NULL, GetModuleHandle(NULL), &state);
+    if (hwnd == NULL) {
+        return InputBox(buffer, maxCount, prompt, title, defaultValue, 0, 0, false);
+    }
+    SetForegroundWindow(hwnd);
+
+    while (!state.done && GetMessage(&msg, NULL, 0, 0) > 0) {
+        if (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        } else if (msg.message < WM_MOUSEFIRST || msg.message > WM_MOUSELAST) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+    SetForegroundWindow(parent);
+    return state.ok != 0;
+}
+
+typedef struct LargeMessageState {
+    const wchar_t *text;
+    const wchar_t *title;
+    UINT type;
+    int windowWidth;
+    int windowHeight;
+    int contentHeight;
+    int useScroll;
+    HFONT textFont;
+    HFONT buttonFont;
+    int done;
+    int result;
+} LargeMessageState;
+
+static std::wstring wrapDialogText(const wchar_t *text, int maxChars)
+{
+    std::wstring out;
+    int col = 0;
+    int i;
+    if (text == NULL) return L"";
+    for (i = 0; text[i] != L'\0'; i++) {
+        wchar_t ch = text[i];
+        if (ch == L'\r') continue;
+        out.push_back(ch);
+        if (ch == L'\n') {
+            col = 0;
+            continue;
+        }
+        col++;
+        if ((ch == 0x3002 || ch == 0xff1b || ch == 0xff1f || ch == 0xff01) && col >= 16) {
+            out.push_back(L'\n');
+            col = 0;
+        } else if ((ch == 0xff0c || ch == 0x3001 || ch == 0xff1a) && col >= 22) {
+            out.push_back(L'\n');
+            col = 0;
+        } else if (col >= maxChars) {
+            out.push_back(L'\n');
+            col = 0;
+        }
+    }
+    return out;
+}
+
+static const wchar_t *textOk(void)
+{
+    return L"\u786e\u5b9a";
+}
+
+static const wchar_t *textCancel(void)
+{
+    return L"\u53d6\u6d88";
+}
+
+static const wchar_t *textTip(void)
+{
+    return L"\u63d0\u793a";
+}
+
+static const wchar_t *textInput(void)
+{
+    return L"\u8f93\u5165";
+}
+
+static LRESULT CALLBACK largeMessageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    LargeMessageState *state = (LargeMessageState *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (msg == WM_CREATE) {
+        CREATESTRUCT *cs = (CREATESTRUCT *)lParam;
+        int hasCancel;
+        int margin = 32;
+        int textY = 30;
+        int buttonY;
+        int okX;
+        int cancelX;
+        HWND textBox;
+        HWND ok;
+        HWND cancel = NULL;
+        state = (LargeMessageState *)cs->lpCreateParams;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)state);
+        hasCancel = (state->type & MB_OKCANCEL) == MB_OKCANCEL;
+        state->textFont = createUiFont(22, FW_NORMAL);
+        state->buttonFont = createUiFont(22, FW_NORMAL);
+        textBox = CreateWindowW(L"STATIC", state->text,
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            margin, textY, state->windowWidth - margin * 2, state->contentHeight,
+            hwnd, NULL, GetModuleHandle(NULL), NULL);
+        buttonY = textY + state->contentHeight + 30;
+        okX = hasCancel ? state->windowWidth - 340 : state->windowWidth - 170;
+        cancelX = state->windowWidth - 170;
+        ok = CreateWindowW(L"BUTTON", L"确定",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            okX, buttonY, 130, 48, hwnd, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
+        if (hasCancel) {
+            cancel = CreateWindowW(L"BUTTON", L"取消",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                cancelX, buttonY, 130, 48, hwnd, (HMENU)IDCANCEL, GetModuleHandle(NULL), NULL);
+        }
+        SetWindowTextW(ok, textOk());
+        if (cancel != NULL) SetWindowTextW(cancel, textCancel());
+        SendMessage(textBox, WM_SETFONT, (WPARAM)state->textFont, TRUE);
+        SendMessage(ok, WM_SETFONT, (WPARAM)state->buttonFont, TRUE);
+        if (cancel != NULL) SendMessage(cancel, WM_SETFONT, (WPARAM)state->buttonFont, TRUE);
+        SetFocus(ok);
+        return 0;
+    }
+    if ((msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT) && state != NULL) {
+        SetBkColor((HDC)wParam, RGB(255, 255, 255));
+        SetTextColor((HDC)wParam, RGB(15, 23, 42));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    if (msg == WM_COMMAND && state != NULL) {
+        int id = LOWORD(wParam);
+        if (id == IDOK || id == IDCANCEL) {
+            state->result = id;
+            state->done = 1;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+    }
+    if (msg == WM_CLOSE && state != NULL) {
+        state->result = IDCANCEL;
+        state->done = 1;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_DESTROY && state != NULL) {
+        if (state->textFont != NULL) DeleteObject(state->textFont);
+        if (state->buttonFont != NULL) DeleteObject(state->buttonFont);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static int runScaledMessageBox(const wchar_t *text, const wchar_t *title, UINT type)
+{
+    static int registered = 0;
+    const wchar_t *className = L"HisLargeMessageBox";
+    HWND parent = GetHWnd();
+    RECT parentRect;
+    int width;
+    int height;
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    int len;
+    int lineCount = 1;
+    int i;
+    std::wstring displayText;
+    LargeMessageState state;
+    HWND hwnd;
+    MSG msg;
+
+    if (!registered) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc = largeMessageProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.lpszClassName = className;
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon = LoadIcon(NULL, IDI_INFORMATION);
+        if (!RegisterClassW(&wc)) return MessageBox(GetHWnd(), text, title, type);
+        registered = 1;
+    }
+
+    displayText = wrapDialogText(text, 32);
+    ZeroMemory(&state, sizeof(state));
+    state.text = displayText.c_str();
+    state.title = title == NULL ? textTip() : title;
+    state.type = type;
+    state.result = IDCANCEL;
+    len = (int)wcslen(state.text);
+    for (i = 0; i < len; i++) {
+        if (state.text[i] == L'\n') lineCount++;
+    }
+    lineCount += len / 34;
+    state.useScroll = 0;
+    width = 860;
+    state.windowWidth = width;
+    state.contentHeight = lineCount * 32 + 30;
+    if (state.contentHeight < 78) state.contentHeight = 78;
+    if (state.contentHeight > 460) state.contentHeight = 460;
+    height = state.contentHeight + 190;
+    state.windowHeight = height;
+
+    if (parent != NULL && GetWindowRect(parent, &parentRect)) {
+        x = parentRect.left + ((parentRect.right - parentRect.left) - width) / 2;
+        y = parentRect.top + ((parentRect.bottom - parentRect.top) - height) / 2;
+    }
+
+    hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, className, state.title,
+        WS_CAPTION | WS_SYSMENU | WS_VISIBLE, x, y, width, height,
+        parent, NULL, GetModuleHandle(NULL), &state);
+    if (hwnd == NULL) {
+        return MessageBox(GetHWnd(), text, title, type);
+    }
+    SetForegroundWindow(hwnd);
+
+    while (!state.done && GetMessage(&msg, NULL, 0, 0) > 0) {
+        if (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        } else if (msg.message < WM_MOUSEFIRST || msg.message > WM_MOUSELAST) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+    if (parent != NULL) {
+        SetForegroundWindow(parent);
+    }
+    return state.result;
 }
 
 enum FormFieldKind {
@@ -357,14 +734,16 @@ static int runForm(const wchar_t *title, const wchar_t *note, FormField fields[]
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                int fieldIndex = hitFormField(fields, count, msg.x, msg.y);
-                int action = hit(buttons, 2, msg.x, msg.y);
+                int mx = uiMouseX(msg.x);
+                int my = uiMouseY(msg.y);
+                int fieldIndex = hitFormField(fields, count, mx, my);
+                int action = hit(buttons, 2, mx, my);
                 if (fieldIndex >= 0) {
                     wchar_t buf[512];
                     std::wstring oldValue = toWide(fields[fieldIndex].value);
                     safeCopy(fields[fieldIndex].value, fields[fieldIndex].valueSize, "");
                     wcsncpy_s(buf, 512, oldValue.c_str(), _TRUNCATE);
-                    if (InputBox(buf, 512, formKindHint(&fields[fieldIndex]), fields[fieldIndex].label, oldValue.c_str(), 0, 0, false)) {
+                    if (runScaledInputBox(buf, 512, formKindHint(&fields[fieldIndex]), fields[fieldIndex].label, oldValue.c_str())) {
                         safeCopy(fields[fieldIndex].value, fields[fieldIndex].valueSize, toUtf8(buf).c_str());
                     } else {
                         safeCopy(fields[fieldIndex].value, fields[fieldIndex].valueSize, toUtf8(oldValue.c_str()).c_str());
@@ -442,13 +821,15 @@ static int runPromptInput(const wchar_t *title, const char *promptText,
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                int action = hit(buttons, 2, msg.x, msg.y);
-                if (msg.x >= boxRect.left && msg.x <= boxRect.right &&
-                    msg.y >= boxRect.top && msg.y <= boxRect.bottom) {
+                int mx = uiMouseX(msg.x);
+                int my = uiMouseY(msg.y);
+                int action = hit(buttons, 2, mx, my);
+                if (mx >= boxRect.left && mx <= boxRect.right &&
+                    my >= boxRect.top && my <= boxRect.bottom) {
                     wchar_t buf[512];
                     std::wstring oldValue = toWide(out);
                     wcsncpy_s(buf, 512, oldValue.c_str(), _TRUNCATE);
-                    if (InputBox(buf, 512, hint, label, oldValue.c_str(), 0, 0, false)) {
+                    if (runScaledInputBox(buf, 512, hint, label, oldValue.c_str())) {
                         safeCopy(out, outSize, toUtf8(buf).c_str());
                     }
                     drawPromptInputForm(title, promptText, label, hint, out);
@@ -544,14 +925,16 @@ static int runPromptForm(const wchar_t *title, const char *promptText, FormField
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                int fieldIndex = hitPromptFormField(count, msg.x, msg.y);
-                int action = hit(buttons, 2, msg.x, msg.y);
+                int mx = uiMouseX(msg.x);
+                int my = uiMouseY(msg.y);
+                int fieldIndex = hitPromptFormField(count, mx, my);
+                int action = hit(buttons, 2, mx, my);
                 if (fieldIndex >= 0) {
                     wchar_t buf[512];
                     std::wstring oldValue = toWide(fields[fieldIndex].value);
                     wcsncpy_s(buf, 512, oldValue.c_str(), _TRUNCATE);
-                    if (InputBox(buf, 512, formKindHint(&fields[fieldIndex]), fields[fieldIndex].label,
-                            oldValue.c_str(), 0, 0, false)) {
+                    if (runScaledInputBox(buf, 512, formKindHint(&fields[fieldIndex]), fields[fieldIndex].label,
+                            oldValue.c_str())) {
                         safeCopy(fields[fieldIndex].value, fields[fieldIndex].valueSize, toUtf8(buf).c_str());
                     }
                     drawPromptForm(title, promptText, fields, count);
@@ -614,13 +997,15 @@ static int runPatientNameInput(char *name, int nameSize)
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                int action = hit(buttons, 2, msg.x, msg.y);
-                if (msg.x >= boxRect.left && msg.x <= boxRect.right &&
-                    msg.y >= boxRect.top && msg.y <= boxRect.bottom) {
+                int mx = uiMouseX(msg.x);
+                int my = uiMouseY(msg.y);
+                int action = hit(buttons, 2, mx, my);
+                if (mx >= boxRect.left && mx <= boxRect.right &&
+                    my >= boxRect.top && my <= boxRect.bottom) {
                     wchar_t buf[512];
                     wcsncpy_s(buf, 512, toWide(name).c_str(), _TRUNCATE);
-                    if (InputBox(buf, 512, L"2-20位，不能含 | 或换行", L"患者姓名",
-                            toWide(name).c_str(), 0, 0, false)) {
+                    if (runScaledInputBox(buf, 512, L"2-20位，不能含 | 或换行", L"患者姓名",
+                            toWide(name).c_str())) {
                         safeCopy(name, nameSize, toUtf8(buf).c_str());
                     }
                     drawPatientNameInput(name);
@@ -733,7 +1118,7 @@ static int askPayPassword(char *out, int outSize)
         {L"支付密码", L"", out, outSize, FORM_PAY_PASSWORD, 0, 0}
     };
     clearText(out, outSize);
-    return runForm(L"支付密码", L"点击输入框填写六位支付密码。", fields, 1);
+    return runForm(L"支付页面", L"请点击输入框填写六位支付密码。", fields, 1);
 }
 
 static std::string trimAscii(const std::string &s)
@@ -919,8 +1304,10 @@ static int askChoice(const wchar_t *title, const char *choices, int maxChoice, i
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                int selected = hitChoiceItem(maxChoice, header, page, msg.x, msg.y);
-                int action = totalPage > 1 ? hit(nav, 3, msg.x, msg.y) : hit(cancel, 1, msg.x, msg.y);
+                int mx = uiMouseX(msg.x);
+                int my = uiMouseY(msg.y);
+                int selected = hitChoiceItem(maxChoice, header, page, mx, my);
+                int action = totalPage > 1 ? hit(nav, 3, mx, my) : hit(cancel, 1, mx, my);
                 if (selected >= 1 && selected <= maxChoice) {
                     *choice = selected;
                     return 1;
@@ -1946,7 +2333,7 @@ static int confirmCheckItems(const char *detailText)
 {
     char confirm[RESULT_LEN];
     snprintf(confirm, sizeof(confirm), "%s\n\n是否确认开立以上检查项目？", detailText);
-    return MessageBox(GetHWnd(), toWide(confirm).c_str(), L"确认检查项目", MB_OKCANCEL | MB_ICONQUESTION) == IDOK;
+    return runScaledMessageBox(toWide(confirm).c_str(), L"确认检查项目", MB_OKCANCEL | MB_ICONQUESTION) == IDOK;
 }
 
 static Ward *chooseWardByDepartment(const char *deptId)
@@ -2273,28 +2660,32 @@ static void doRegister(void)
         message(L"您已在该日期挂过该科室号，无需重复挂号。");
         return;
     }
-    {
-        FormField fields[] = {
-            {L"挂号说明", L"可为空，不能含 | 或换行", note, sizeof(note), FORM_TEXT, 0, 0},
-            {L"支付密码", L"", payPwd, sizeof(payPwd), FORM_PAY_PASSWORD, 0, 0}
-        };
-        clearText(note, sizeof(note));
-        clearText(payPwd, sizeof(payPwd));
-        if (!runForm(L"挂号信息填写", L"请填写挂号说明和六位支付密码。", fields, 2)) return;
-    }
+    clearText(note, sizeof(note));
+    clearText(payPwd, sizeof(payPwd));
     fee = registerFeeByTitle(doctor->title);
-    (void)payPwd;
 
     modeText = (regStatus == 1) ? "直接挂号（已挂号）" : "预约（就诊日当天来院候诊）";
     snprintf(confirm, sizeof(confirm),
-        "请核对以下挂号信息，核对无误请点击「确定」进入缴费；点击「取消」可返回重新选择。\n\n"
-        "患者：%s\n科室：%s\n医生：%s  （%s）\n出诊安排：%s\n就诊日期：%s\n业务类型：%s\n挂号费：%.2f 元\n说明：%s\n",
+        "患者姓名：%s\n"
+        "科室：%s\n"
+        "医生：%s\n"
+        "医生职称：%s\n"
+        "出诊安排：%s\n"
+        "就诊日期：%s\n"
+        "业务类型：%s\n"
+        "挂号费：%.2f 元\n\n"
+        "请确认挂号信息无误后进入支付。",
         patient->name, dept->name, doctor->name, doctor->title, doctor->workTime, visitDate,
-        modeText, fee, note);
-    if (MessageBox(GetHWnd(), toWide(confirm).c_str(), L"挂号确认单", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
+        modeText, fee);
+    if (runScaledMessageBox(toWide(confirm).c_str(), L"挂号确认单", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
         message(L"已取消挂号。");
         return;
     }
+    if (!askPayPassword(payPwd, sizeof(payPwd))) {
+        message(L"已取消支付，挂号未生成。");
+        return;
+    }
+    (void)payPwd;
 
     getCurrentDate(today, sizeof(today));
     makeNextRecordId(recId, sizeof(recId));
@@ -2629,7 +3020,7 @@ static void doVisit(void)
         patient->cardId, patient->phone,
         dept ? dept->name : "未知科室",
         doctor ? doctor->name : "(无)");
-    if (MessageBox(GetHWnd(), toWide(confirmText).c_str(), L"患者信息确认", MB_OKCANCEL) != IDOK) {
+    if (runScaledMessageBox(toWide(confirmText).c_str(), L"患者信息确认", MB_OKCANCEL) != IDOK) {
         message(L"已取消接诊。");
         return;
     }
@@ -2833,15 +3224,17 @@ static int runPrescriptionOrderForm(const char *deptId, Medicine *meds[],
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                int action = hit(buttons, 2, msg.x, msg.y);
+                int mx = uiMouseX(msg.x);
+                int my = uiMouseY(msg.y);
+                int action = hit(buttons, 2, mx, my);
                 int slot = -1;
                 int area = 0;
                 for (i = 0; i < slotCount; i++) {
                     int y = 220 + i * 52;
-                    if (msg.y >= y && msg.y <= y + 40) {
-                        if (msg.x >= 145 && msg.x <= 445) { slot = i; area = 1; break; }
-                        if (msg.x >= 465 && msg.x <= 585) { slot = i; area = 2; break; }
-                        if (msg.x >= 605 && msg.x <= 965) { slot = i; area = 3; break; }
+                    if (my >= y && my <= y + 40) {
+                        if (mx >= 145 && mx <= 445) { slot = i; area = 1; break; }
+                        if (mx >= 465 && mx <= 585) { slot = i; area = 2; break; }
+                        if (mx >= 605 && mx <= 965) { slot = i; area = 3; break; }
                     }
                 }
                 if (slot >= 0 && area == 1) {
@@ -2851,16 +3244,16 @@ static int runPrescriptionOrderForm(const char *deptId, Medicine *meds[],
                 } else if (slot >= 0 && area == 2) {
                     wchar_t buf[64];
                     wcsncpy_s(buf, 64, toWide(qtyText[slot]).c_str(), _TRUNCATE);
-                    if (InputBox(buf, 64, L"1-9999 的整数", L"药品数量",
-                            toWide(qtyText[slot]).c_str(), 0, 0, false)) {
+                    if (runScaledInputBox(buf, 64, L"1-9999 的整数", L"药品数量",
+                            toWide(qtyText[slot]).c_str())) {
                         safeCopy(qtyText[slot], 16, toUtf8(buf).c_str());
                     }
                     drawPrescriptionOrderForm(deptId, meds, qtyText, adviceList, slotCount);
                 } else if (slot >= 0 && area == 3) {
                     wchar_t buf[512];
                     wcsncpy_s(buf, 512, toWide(adviceList[slot]).c_str(), _TRUNCATE);
-                    if (InputBox(buf, 512, L"可不填，不能含 | 或换行", L"用药医嘱",
-                            toWide(adviceList[slot]).c_str(), 0, 0, false)) {
+                    if (runScaledInputBox(buf, 512, L"可不填，不能含 | 或换行", L"用药医嘱",
+                            toWide(adviceList[slot]).c_str())) {
                         safeCopy(adviceList[slot], TEXT_LEN, toUtf8(buf).c_str());
                     }
                     drawPrescriptionOrderForm(deptId, meds, qtyText, adviceList, slotCount);
@@ -3170,7 +3563,7 @@ static void doAdmit(void)
         } else {
             char info[LINE_LEN];
             snprintf(info, sizeof(info), "该患者没有挂号记录。\n点击确定手动选择入院科室，点击取消返回。");
-            if (MessageBox(GetHWnd(), toWide(info).c_str(), L"无挂号记录", MB_OKCANCEL) != IDOK) {
+            if (runScaledMessageBox(toWide(info).c_str(), L"无挂号记录", MB_OKCANCEL) != IDOK) {
                 return;
             }
             dept = chooseDepartment();
@@ -3197,15 +3590,15 @@ static void doAdmit(void)
         // 答辩注意：未知科室护理费为0时发出警告，避免收费偏低（难度：简单）
         if (nursingFee == 0.0) {
             snprintf(info, sizeof(info),
-                "患者所属科室：%s\n单日护理费：%.2f元/天\n\n⚠ 警告：该科室不在预设护理费列表中，护理费将按0元计算！\n请联系管理员添加该科室的护理费标准。\n\n（点击确定继续，点击取消返回）",
+                "患者所属科室：%s\n单日护理费：%.2f元/天\n\n警告：该科室不在预设护理费列表中，护理费将按0元计算！\n请联系管理员添加该科室的护理费标准。\n\n（点击确定继续，点击取消返回）",
                 dept->name, nursingFee);
-            if (MessageBox(GetHWnd(), toWide(info).c_str(), L"⚠ 科室护理费未设置", MB_OKCANCEL) != IDOK) {
+            if (runScaledMessageBox(toWide(info).c_str(), L"科室护理费未设置", MB_OKCANCEL) != IDOK) {
                 return;
             }
         } else {
             snprintf(info, sizeof(info), "患者所属科室：%s\n单日护理费：%.2f元/天\n\n（护理费由系统自动匹配，不支持手动修改）",
                 dept->name, nursingFee);
-            MessageBox(GetHWnd(), toWide(info).c_str(), L"科室护理费信息", MB_OK);
+            runScaledMessageBox(toWide(info).c_str(), L"科室护理费信息", MB_OK);
         }
     }
     // 答辩注意：默认填充当天日期，减少用户输入（难度：简单）
@@ -3227,7 +3620,7 @@ static void doAdmit(void)
     }
     // 答辩注意：押金为0时给出警告，避免财务漏洞（难度：简单）
     if (deposit == 0.0) {
-        if (MessageBox(GetHWnd(), L"押金金额为0元，住院期间费用将无法抵扣，是否继续？",
+        if (runScaledMessageBox(L"押金金额为0元，住院期间费用将无法抵扣，是否继续？",
             L"押金为0警告", MB_OKCANCEL) != IDOK) {
             return;
         }
@@ -3317,7 +3710,7 @@ static void doLeave(void)
             snprintf(warn, sizeof(warn),
                 "科室「%s」不在预设护理费列表中，将按0元计算。\n请确认是否继续出院结算。",
                 dept->name);
-            if (MessageBox(GetHWnd(), toWide(warn).c_str(), L"⚠ 护理费未设置", MB_OKCANCEL) != IDOK) {
+            if (runScaledMessageBox(toWide(warn).c_str(), L"护理费未设置", MB_OKCANCEL) != IDOK) {
                 return;
             }
         }
@@ -3355,7 +3748,7 @@ static void doLeave(void)
             payAmount > 0 ?
                 "点击确定生成待缴住院费账单。缴清后将自动出院并释放床位。" :
                 "押金已覆盖全部住院费用，点击确定将直接办理出院。");
-        if (MessageBox(GetHWnd(), toWide(preview).c_str(), L"住院费用预览", MB_OKCANCEL) != IDOK) {
+        if (runScaledMessageBox(toWide(preview).c_str(), L"住院费用预览", MB_OKCANCEL) != IDOK) {
             message(L"已取消出院结算。");
             return;
         }
@@ -3804,7 +4197,7 @@ static void manageBackupRestore(void)
         return;
     }
     if (choice == 2) {
-        if (MessageBox(GetHWnd(),
+        if (runScaledMessageBox(
             L"恢复会用最近备份覆盖当前 data 目录中的业务数据。\n该操作只允许管理员手动触发，确认继续吗？",
             L"确认恢复最近备份", MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
             writeAdminLog("恢复备份", "backup", "取消");
@@ -4033,17 +4426,17 @@ static void copyResultPage(char *out, int outSize, int pageNo, int pageSize)
 
 static void drawResultPage(void)
 {
-    const int pageSize = 10;
+    const int pageSize = RESULT_PAGE_SIZE;
     int totalLine = countResultLines();
     int totalPage = totalLine == 0 ? 1 : (totalLine + pageSize - 1) / pageSize;
     char pageText[RESULT_LEN];
     wchar_t pageInfo[64];
     Button pageButtons[] = {
-        {250, 500, 370, 550, L"首页", 101},
-        {370, 500, 510, 550, L"上一页", 102},
-        {510, 500, 650, 550, L"下一页", 103},
-        {650, 500, 770, 550, L"末页", 104},
-        {830, 500, 980, 550, L"返回", 100}
+        {250, 505, 370, 555, L"首页", 101},
+        {370, 505, 510, 555, L"上一页", 102},
+        {510, 505, 650, 555, L"下一页", 103},
+        {650, 505, 770, 555, L"末页", 104},
+        {830, 505, 980, 555, L"返回", 100}
     };
     if (resultPageNo < 0) resultPageNo = 0;
     if (resultPageNo >= totalPage) resultPageNo = totalPage - 1;
@@ -4058,10 +4451,10 @@ static void drawResultPage(void)
     setfillcolor(WHITE);
     setlinecolor(BLACK);
     setlinestyle(PS_SOLID, 2);
-    rectangle(55, 190, 1005, 480);
+    rectangle(55, 178, 1005, 485);
 
-    RECT r = {75, 205, 985, 470};
-    useClearFont(24, FW_SEMIBOLD);
+    RECT r = {75, 190, 985, 475};
+    useClearFont(21, FW_SEMIBOLD);
     settextcolor(BLACK);
     drawtext(toWide(pageText).c_str(), &r, DT_LEFT | DT_TOP | DT_WORDBREAK);
     drawButtons(pageButtons, 5);
@@ -4273,11 +4666,11 @@ static void handleAction(int action)
         if (resultPageNo > 0) resultPageNo--;
     } else if (action == 103) {
         int totalLine = countResultLines();
-        int totalPage = totalLine == 0 ? 1 : (totalLine + 9) / 10;
+        int totalPage = totalLine == 0 ? 1 : (totalLine + RESULT_PAGE_SIZE - 1) / RESULT_PAGE_SIZE;
         if (resultPageNo < totalPage - 1) resultPageNo++;
     } else if (action == 104) {
         int totalLine = countResultLines();
-        int totalPage = totalLine == 0 ? 1 : (totalLine + 9) / 10;
+        int totalPage = totalLine == 0 ? 1 : (totalLine + RESULT_PAGE_SIZE - 1) / RESULT_PAGE_SIZE;
         resultPageNo = totalPage - 1;
     }
 }
@@ -4285,7 +4678,8 @@ static void handleAction(int action)
 void runGui(void)
 {
     SetProcessDPIAware();
-    initgraph(WIN_W, WIN_H);
+    initgraph(WINDOW_W, WINDOW_H);
+    setaspectratio((float)UI_SCALE, (float)UI_SCALE);
     setbkcolor(RGB(248, 250, 252));
     loadAllData("data", resultText, sizeof(resultText));
     loadAuthData("data\\account.txt");
@@ -4296,8 +4690,11 @@ void runGui(void)
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
-                handleAction(actionAt(msg.x, msg.y));
-                drawPage();
+                int action = actionAt(uiMouseX(msg.x), uiMouseY(msg.y));
+                handleAction(action);
+                if (action >= 0) {
+                    drawPage();
+                }
             }
         }
         Sleep(10);
