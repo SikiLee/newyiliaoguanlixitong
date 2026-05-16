@@ -18,8 +18,9 @@ static void appendTest(char *out,int outSize,const char *name,const char *input,
     const char *expect,const char *actual,int pass,const char *level)
 {
     char line[LINE_LEN * 2];
-    snprintf(line,sizeof(line),"T%03d | %s | 输入：%s | 预期：%s | 实际：%s | %s | 难度：%s\n",
-        testNo,name,input,expect,actual,pass ? "通过" : "失败",level);
+    (void)expect;
+    snprintf(line,sizeof(line),"T%03d | %s | 输入：%s | 输出：%s | %s | 难度：%s\n",
+        testNo,name,input,actual,pass ? "通过" : "失败",level);
     appendText(out,outSize,line);
     testNo++;
 }
@@ -212,7 +213,6 @@ void runAllTests(char *out,int outSize)
     char part[RESULT_LEN];
     clearText(out,outSize);
     appendLine(out,outSize,"系统全部测试");
-    appendLine(out,outSize,"答辩注意：测试入口集中展示输入校验、流程和边界，说明测试覆盖面即可（难度：中等）");
     runInputTests(part,sizeof(part));
     appendText(out,outSize,part);
     appendLine(out,outSize,"");

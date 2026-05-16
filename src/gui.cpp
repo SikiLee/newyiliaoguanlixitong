@@ -44,6 +44,23 @@ typedef struct CheckItem {
     double price;
 } CheckItem;
 
+typedef struct DashboardStats {
+    double totalIncome;
+    int todayRegisterCount;
+    int unpaidCount;
+    int occupiedBeds;
+    int totalBeds;
+    double bedOccupancyRate;
+    int lowStockMedicineCount;
+} DashboardStats;
+
+typedef struct WarningStats {
+    int lowStockMedicineCount;
+    int unpaidPaymentCount;
+    int bedShortageWardCount;
+    int lowDoctorSlotCount;
+} WarningStats;
+
 // 答辩注意：按科室预设检查项目列表，数据来自项目约定（难度：简单）
 static CheckItem internalCheckItems[] = {
     // DEP0001 内科
@@ -85,6 +102,10 @@ static char resultText[RESULT_LEN];
 static int resultPageNo = 0;
 static char loggedPatientId[ID_LEN] = "";
 static char loggedDoctorId[ID_LEN] = "";
+static int adminLoggedIn = 0;
+static char currentAdminName[NAME_LEN] = "";
+static char lastAutoBackupDate[DATE_LEN] = "";
+static DWORD lastAutoBackupTick = 0;
 
 typedef struct AuthAccount {
     char role[STATUS_LEN];
@@ -115,6 +136,18 @@ static void doPatientLogin(void);
 static void doPatientRegister(void);
 static void doDoctorLogin(void);
 static void doDoctorRegister(void);
+static void doAdminLogin(void);
+static void writeAdminLog(const char *action, const char *object, const char *result);
+static void buildDashboardStats(DashboardStats *stats);
+static void buildWarningStats(WarningStats *stats);
+static void buildWarningReport(char *out, int outSize);
+static void showWarningCenter(void);
+static void showAdminLogs(void);
+static int performBackup(const char *reason, char *out, int outSize);
+static int restoreLatestBackup(char *out, int outSize);
+static void manageBackupRestore(void);
+static void checkAutoBackup(void);
+static void drawAdminDashboard(void);
 
 static std::wstring toWide(const char *s)
 {
@@ -943,6 +976,398 @@ static void removeLineEnd(char *s)
     }
 }
 
+static int isDirectoryA(const char *path)
+{
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int isFileA(const char *path)
+{
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int ensureDirectoryA(const char *path)
+{
+    if (isDirectoryA(path)) return 1;
+    if (CreateDirectoryA(path, NULL)) return 1;
+    return GetLastError() == ERROR_ALREADY_EXISTS && isDirectoryA(path);
+}
+
+static const char *adminNameForLog(void)
+{
+    return currentAdminName[0] ? currentAdminName : "admin";
+}
+
+static void writeAdminLog(const char *action, const char *object, const char *result)
+{
+    FILE *fp;
+    char timestamp[TIME_LEN];
+    if (!ensureDirectoryA("data")) return;
+    fp = fopen("data\\admin_log.txt", "a");
+    if (fp == NULL) return;
+    getCurrentDateTime(timestamp, sizeof(timestamp));
+    fprintf(fp, "%s|%s|%s|%s|%s\n",
+        timestamp,
+        adminNameForLog(),
+        action ? action : "",
+        object ? object : "",
+        result ? result : "");
+    fclose(fp);
+}
+
+static void buildDashboardStats(DashboardStats *stats)
+{
+    Payment *payment;
+    MedicalRecord *record;
+    Medicine *medicine;
+    Ward *ward;
+    Bed *bed;
+    char today[DATE_LEN];
+    int wardTotal = 0;
+    int wardFree = 0;
+
+    memset(stats, 0, sizeof(*stats));
+    getCurrentDate(today, sizeof(today));
+
+    payment = paymentHead;
+    while (payment != NULL) {
+        if (strcmp(payment->status, "已缴费") == 0) {
+            stats->totalIncome += payment->amount;
+        } else if (strcmp(payment->status, "未缴费") == 0) {
+            stats->unpaidCount++;
+        }
+        payment = payment->next;
+    }
+
+    record = recordHead;
+    while (record != NULL) {
+        if (strcmp(record->type, "挂号") == 0 && strcmp(record->date, today) == 0) {
+            stats->todayRegisterCount++;
+        }
+        record = record->next;
+    }
+
+    ward = wardHead;
+    while (ward != NULL) {
+        wardTotal += ward->totalBeds;
+        wardFree += ward->freeBeds;
+        ward = ward->next;
+    }
+    if (wardTotal > 0) {
+        stats->totalBeds = wardTotal;
+        stats->occupiedBeds = wardTotal - wardFree;
+    } else {
+        bed = bedHead;
+        while (bed != NULL) {
+            stats->totalBeds++;
+            if (strcmp(bed->status, "占用") == 0) stats->occupiedBeds++;
+            bed = bed->next;
+        }
+    }
+    if (stats->occupiedBeds < 0) stats->occupiedBeds = 0;
+    if (stats->occupiedBeds > stats->totalBeds) stats->occupiedBeds = stats->totalBeds;
+    if (stats->totalBeds > 0) {
+        stats->bedOccupancyRate = stats->occupiedBeds * 100.0 / stats->totalBeds;
+    }
+
+    medicine = medicineHead;
+    while (medicine != NULL) {
+        if (medicine->stock <= medicine->lowLimit) stats->lowStockMedicineCount++;
+        medicine = medicine->next;
+    }
+}
+
+static void buildWarningStats(WarningStats *stats)
+{
+    Medicine *medicine;
+    Payment *payment;
+    Ward *ward;
+    Doctor *doctor;
+
+    memset(stats, 0, sizeof(*stats));
+
+    medicine = medicineHead;
+    while (medicine != NULL) {
+        if (medicine->stock <= medicine->lowLimit) stats->lowStockMedicineCount++;
+        medicine = medicine->next;
+    }
+
+    payment = paymentHead;
+    while (payment != NULL) {
+        if (strcmp(payment->status, "未缴费") == 0) stats->unpaidPaymentCount++;
+        payment = payment->next;
+    }
+
+    ward = wardHead;
+    while (ward != NULL) {
+        if (ward->totalBeds > 0 && (ward->freeBeds <= 1 || ward->freeBeds * 100 <= ward->totalBeds * 10)) {
+            stats->bedShortageWardCount++;
+        }
+        ward = ward->next;
+    }
+
+    doctor = doctorHead;
+    while (doctor != NULL) {
+        if (doctor->maxCount <= 3) stats->lowDoctorSlotCount++;
+        doctor = doctor->next;
+    }
+}
+
+static void buildWarningReport(char *out, int outSize)
+{
+    Medicine *medicine;
+    Payment *payment;
+    Ward *ward;
+    Doctor *doctor;
+    char line[LINE_LEN];
+    int count;
+
+    clearText(out, outSize);
+    appendLine(out, outSize, "预警中心");
+    appendLine(out, outSize, "用于集中查看库存、缴费、床位和医生号源风险。\n");
+
+    appendLine(out, outSize, "【低库存药品】");
+    count = 0;
+    medicine = medicineHead;
+    while (medicine != NULL) {
+        if (medicine->stock <= medicine->lowLimit) {
+            Department *dept = findDepartmentById(medicine->deptId);
+            snprintf(line, sizeof(line), "%d. %s  科室：%s  库存：%d  下限：%d\n",
+                ++count, medicine->name, dept ? dept->name : "未知科室", medicine->stock, medicine->lowLimit);
+            appendText(out, outSize, line);
+        }
+        medicine = medicine->next;
+    }
+    if (count == 0) appendLine(out, outSize, "暂无低库存药品。");
+
+    appendLine(out, outSize, "\n【未缴费账单】");
+    count = 0;
+    payment = paymentHead;
+    while (payment != NULL) {
+        if (strcmp(payment->status, "未缴费") == 0) {
+            Patient *patient = findPatientById(payment->patientId);
+            snprintf(line, sizeof(line), "%d. %s  患者：%s  类型：%s  金额：%.2f  日期：%s\n",
+                ++count, payment->id, patient ? patient->name : "未知患者",
+                payment->sourceType, payment->amount, payment->date);
+            appendText(out, outSize, line);
+        }
+        payment = payment->next;
+    }
+    if (count == 0) appendLine(out, outSize, "暂无未缴费账单。");
+
+    appendLine(out, outSize, "\n【空床不足病房】");
+    count = 0;
+    ward = wardHead;
+    while (ward != NULL) {
+        if (ward->totalBeds > 0 && (ward->freeBeds <= 1 || ward->freeBeds * 100 <= ward->totalBeds * 10)) {
+            Department *dept = findDepartmentById(ward->deptId);
+            snprintf(line, sizeof(line), "%d. %s  科室：%s  空床：%d/%d\n",
+                ++count, ward->type, dept ? dept->name : "未知科室", ward->freeBeds, ward->totalBeds);
+            appendText(out, outSize, line);
+        }
+        ward = ward->next;
+    }
+    if (count == 0) appendLine(out, outSize, "暂无床位紧张病房。");
+
+    appendLine(out, outSize, "\n【医生号源不足】");
+    count = 0;
+    doctor = doctorHead;
+    while (doctor != NULL) {
+        if (doctor->maxCount <= 3) {
+            Department *dept = findDepartmentById(doctor->deptId);
+            snprintf(line, sizeof(line), "%d. %s  科室：%s  剩余号源：%d\n",
+                ++count, doctor->name, dept ? dept->name : "未知科室", doctor->maxCount);
+            appendText(out, outSize, line);
+        }
+        doctor = doctor->next;
+    }
+    if (count == 0) appendLine(out, outSize, "暂无号源不足医生。");
+}
+
+static const char *backupFileList[] = {
+    "department.txt",
+    "patient.txt",
+    "doctor.txt",
+    "medicine.txt",
+    "ward.txt",
+    "bed.txt",
+    "record.txt",
+    "prescription.txt",
+    "prescription_item.txt",
+    "payment.txt",
+    "account.txt",
+    "admin_log.txt"
+};
+
+static int backupFileCount(void)
+{
+    return (int)(sizeof(backupFileList) / sizeof(backupFileList[0]));
+}
+
+static void makeBackupFolderName(char *out, int outSize)
+{
+    time_t now = time(NULL);
+    struct tm t;
+    localtime_s(&t, &now);
+    strftime(out, outSize, "backup\\%Y-%m-%d_%H%M%S", &t);
+}
+
+static void copyTxtFiles(const char *fromDir, const char *toDir, int *copied, int *skipped, int *failed)
+{
+    int i;
+    char src[MAX_PATH];
+    char dst[MAX_PATH];
+    *copied = 0;
+    *skipped = 0;
+    *failed = 0;
+    for (i = 0; i < backupFileCount(); i++) {
+        snprintf(src, sizeof(src), "%s\\%s", fromDir, backupFileList[i]);
+        snprintf(dst, sizeof(dst), "%s\\%s", toDir, backupFileList[i]);
+        if (!isFileA(src)) {
+            (*skipped)++;
+            continue;
+        }
+        if (CopyFileA(src, dst, FALSE)) {
+            (*copied)++;
+        } else {
+            (*failed)++;
+        }
+    }
+}
+
+static int backupExistsForDate(const char *date)
+{
+    char pattern[MAX_PATH];
+    WIN32_FIND_DATAA data;
+    HANDLE h;
+    snprintf(pattern, sizeof(pattern), "backup\\%s_*", date);
+    h = FindFirstFileA(pattern, &data);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            strcmp(data.cFileName, ".") != 0 &&
+            strcmp(data.cFileName, "..") != 0) {
+            FindClose(h);
+            return 1;
+        }
+    } while (FindNextFileA(h, &data));
+    FindClose(h);
+    return 0;
+}
+
+static int findLatestBackup(char *out, int outSize)
+{
+    WIN32_FIND_DATAA data;
+    HANDLE h;
+    char latest[MAX_PATH] = "";
+
+    if (!isDirectoryA("backup")) return 0;
+    h = FindFirstFileA("backup\\*", &data);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            strcmp(data.cFileName, ".") != 0 &&
+            strcmp(data.cFileName, "..") != 0 &&
+            strchr(data.cFileName, '_') != NULL) {
+            if (latest[0] == '\0' || strcmp(data.cFileName, latest) > 0) {
+                safeCopy(latest, sizeof(latest), data.cFileName);
+            }
+        }
+    } while (FindNextFileA(h, &data));
+    FindClose(h);
+
+    if (latest[0] == '\0') return 0;
+    snprintf(out, outSize, "backup\\%s", latest);
+    return 1;
+}
+
+static int performBackupCore(const char *reason, char *out, int outSize, int saveBeforeCopy)
+{
+    char folder[MAX_PATH];
+    char saveMsg[TEXT_LEN];
+    int copied, skipped, failed;
+
+    clearText(out, outSize);
+    if (!ensureDirectoryA("data") || !ensureDirectoryA("backup")) {
+        appendLine(out, outSize, "备份失败：无法创建 data 或 backup 目录。");
+        writeAdminLog(reason ? reason : "备份", "backup", "失败：目录不可用");
+        return ERR_FILE;
+    }
+
+    if (saveBeforeCopy) {
+        saveAllData("data", saveMsg, sizeof(saveMsg));
+        saveAuthData("data\\account.txt");
+    }
+    makeBackupFolderName(folder, sizeof(folder));
+    if (!ensureDirectoryA(folder)) {
+        appendLine(out, outSize, "备份失败：无法创建备份目录。");
+        writeAdminLog(reason ? reason : "备份", folder, "失败：目录创建失败");
+        return ERR_FILE;
+    }
+
+    copyTxtFiles("data", folder, &copied, &skipped, &failed);
+    snprintf(out, outSize,
+        "%s完成\n备份目录：%s\n复制文件：%d\n跳过缺失文件：%d\n失败文件：%d\n",
+        reason ? reason : "备份", folder, copied, skipped, failed);
+    writeAdminLog(reason ? reason : "备份", folder, failed == 0 ? "成功" : "部分失败");
+    return failed == 0 ? OK : ERR_FILE;
+}
+
+static int performBackup(const char *reason, char *out, int outSize)
+{
+    return performBackupCore(reason, out, outSize, 1);
+}
+
+static int restoreLatestBackup(char *out, int outSize)
+{
+    char folder[MAX_PATH];
+    char loadMsg[TEXT_LEN];
+    int copied, skipped, failed;
+
+    clearText(out, outSize);
+    if (!findLatestBackup(folder, sizeof(folder))) {
+        appendLine(out, outSize, "恢复失败：没有找到可用备份。");
+        writeAdminLog("恢复备份", "backup", "失败：无备份");
+        return ERR_NOT_FOUND;
+    }
+    if (!ensureDirectoryA("data")) {
+        appendLine(out, outSize, "恢复失败：无法创建 data 目录。");
+        writeAdminLog("恢复备份", folder, "失败：data目录不可用");
+        return ERR_FILE;
+    }
+
+    copyTxtFiles(folder, "data", &copied, &skipped, &failed);
+    loadAllData("data", loadMsg, sizeof(loadMsg));
+    loadAuthData("data\\account.txt");
+    if (currentPatient() == NULL) clearText(loggedPatientId, sizeof(loggedPatientId));
+    if (currentDoctor() == NULL) clearText(loggedDoctorId, sizeof(loggedDoctorId));
+
+    snprintf(out, outSize,
+        "恢复最近备份完成\n备份目录：%s\n恢复文件：%d\n备份中缺失文件：%d\n失败文件：%d\n\n%s",
+        folder, copied, skipped, failed, loadMsg);
+    writeAdminLog("恢复备份", folder, failed == 0 ? "成功" : "部分失败");
+    return failed == 0 ? OK : ERR_FILE;
+}
+
+static void checkAutoBackup(void)
+{
+    char today[DATE_LEN];
+    char out[RESULT_LEN];
+    DWORD nowTick = GetTickCount();
+
+    if (lastAutoBackupTick != 0 && nowTick - lastAutoBackupTick < 60000) return;
+    lastAutoBackupTick = nowTick;
+
+    getCurrentDate(today, sizeof(today));
+    if (strcmp(lastAutoBackupDate, today) == 0) return;
+    if (!backupExistsForDate(today)) {
+        performBackupCore("自动备份", out, sizeof(out), 0);
+    }
+    safeCopy(lastAutoBackupDate, sizeof(lastAutoBackupDate), today);
+}
+
 static Patient *findPatientByPhoneLocal(const char *phone)
 {
     Patient *p = patientHead;
@@ -1741,6 +2166,31 @@ static void doDoctorRegister(void)
     openResult(out);
 }
 
+static void doAdminLogin(void)
+{
+    char account[NAME_LEN];
+    char password[STATUS_LEN];
+    FormField fields[] = {
+        {L"管理员账号", L"固定测试账号：admin", account, sizeof(account), FORM_TEXT, 0, 0},
+        {L"管理员密码", L"固定测试密码：admin123", password, sizeof(password), FORM_TEXT, 0, 0}
+    };
+
+    clearText(account, sizeof(account));
+    clearText(password, sizeof(password));
+    if (!runForm(L"管理员登录", L"", fields, 2)) return;
+
+    if (strcmp(account, "admin") != 0 || strcmp(password, "admin123") != 0) {
+        writeAdminLog("管理员登录", account, "失败");
+        message(L"管理员账号或密码错误。");
+        return;
+    }
+
+    adminLoggedIn = 1;
+    safeCopy(currentAdminName, sizeof(currentAdminName), "admin");
+    writeAdminLog("管理员登录", "管理端", "成功");
+    currentPage = PAGE_ADMIN;
+}
+
 static void doAddPatient(void)
 {
     char id[ID_LEN], name[NAME_LEN], gender[STATUS_LEN], phone[PHONE_LEN], card[NAME_LEN], status[STATUS_LEN];
@@ -1769,6 +2219,7 @@ static void doAddPatient(void)
     makeNextPatientId(id, sizeof(id));
     code = addPatient(id, name, gender, age, phone, card, status);
     snprintf(out, sizeof(out), "新增患者：%s\n系统生成编号：%s\n结果：%s\n", name, id, codeText(code));
+    if (adminLoggedIn) writeAdminLog("新增患者", id, codeText(code));
     openResult(out);
 }
 
@@ -1811,15 +2262,6 @@ static void doRegister(void)
         regStatus = 0;
         break;
     }
-    {
-        FormField fields[] = {
-            {L"挂号说明", L"可为空，不能含 | 或换行", note, sizeof(note), FORM_TEXT, 0, 0},
-            {L"支付密码", L"", payPwd, sizeof(payPwd), FORM_PAY_PASSWORD, 0, 0}
-        };
-        clearText(note, sizeof(note));
-        clearText(payPwd, sizeof(payPwd));
-        if (!runForm(L"挂号信息填写", L"请填写挂号说明和六位支付密码。", fields, 2)) return;
-    }
     dept = chooseDepartment();
     if (dept == NULL) return;
     doctor = chooseDoctorForRegister(dept->id, visitDate);
@@ -1831,6 +2273,15 @@ static void doRegister(void)
     if (hasPatientDeptRegisterOnDate(patient->id, dept->id, visitDate)) {
         message(L"您已在该日期挂过该科室号，无需重复挂号。");
         return;
+    }
+    {
+        FormField fields[] = {
+            {L"挂号说明", L"可为空，不能含 | 或换行", note, sizeof(note), FORM_TEXT, 0, 0},
+            {L"支付密码", L"", payPwd, sizeof(payPwd), FORM_PAY_PASSWORD, 0, 0}
+        };
+        clearText(note, sizeof(note));
+        clearText(payPwd, sizeof(payPwd));
+        if (!runForm(L"挂号信息填写", L"请填写挂号说明和六位支付密码。", fields, 2)) return;
     }
     fee = registerFeeByTitle(doctor->title);
     (void)payPwd;
@@ -2969,13 +3420,17 @@ static void managePatients(void)
         }
         code = updatePatient(p->id, phone, status);
         snprintf(out, sizeof(out), "修改患者结果：%s\n", codeText(code));
+        writeAdminLog("修改患者", p->id, codeText(code));
         openResult(out);
     } else if (choice == 4) {
         Patient *p = choosePatient();
         int code;
+        char patientId[ID_LEN];
         if (p == NULL) return;
+        safeCopy(patientId, sizeof(patientId), p->id);
         code = deletePatient(p->id);
         snprintf(out, sizeof(out), "删除患者结果：%s\n", codeText(code));
+        writeAdminLog("删除患者", patientId, codeText(code));
         openResult(out);
     } else {
         listPatients(out, sizeof(out));
@@ -3002,6 +3457,7 @@ static void manageDepartments(void)
         makeNextDepartmentId(id, sizeof(id));
         code = addDepartment(id, name, intro, wardType);
         snprintf(out, sizeof(out), "新增科室编号：%s\n结果：%s\n", id, codeText(code));
+        writeAdminLog("新增科室", id, codeText(code));
         openResult(out);
     } else if (choice == 2) {
         listDepartments(out, sizeof(out));
@@ -3020,12 +3476,16 @@ static void manageDepartments(void)
         }
         code = updateDepartment(dept->id, intro, wardType);
         snprintf(out, sizeof(out), "修改科室结果：%s\n", codeText(code));
+        writeAdminLog("修改科室", dept->id, codeText(code));
         openResult(out);
     } else {
+        char deptId[ID_LEN];
         dept = chooseDepartment();
         if (dept == NULL) return;
+        safeCopy(deptId, sizeof(deptId), dept->id);
         code = deleteDepartment(dept->id);
         snprintf(out, sizeof(out), "删除科室结果：%s\n", codeText(code));
+        writeAdminLog("删除科室", deptId, codeText(code));
         openResult(out);
     }
 }
@@ -3058,6 +3518,7 @@ static void manageDoctors(void)
         makeNextDoctorId(id, sizeof(id));
         code = addDoctor(id, name, dept->id, title, workTime, maxCount);
         snprintf(out, sizeof(out), "新增医生编号：%s\n结果：%s\n", id, codeText(code));
+        writeAdminLog("新增医生", id, codeText(code));
         openResult(out);
     } else if (choice == 2) {
         listDoctors(out, sizeof(out));
@@ -3079,12 +3540,16 @@ static void manageDoctors(void)
         }
         code = updateDoctor(doctor->id, title, workTime, maxCount);
         snprintf(out, sizeof(out), "修改医生结果：%s\n", codeText(code));
+        writeAdminLog("修改医生", doctor->id, codeText(code));
         openResult(out);
     } else {
+        char doctorId[ID_LEN];
         doctor = chooseDoctor();
         if (doctor == NULL) return;
+        safeCopy(doctorId, sizeof(doctorId), doctor->id);
         code = deleteDoctor(doctor->id);
         snprintf(out, sizeof(out), "删除医生结果：%s\n", codeText(code));
+        writeAdminLog("删除医生", doctorId, codeText(code));
         openResult(out);
     }
 }
@@ -3126,6 +3591,7 @@ static void manageMedicines(void)
         makeNextMedicineId(id, sizeof(id));
         code = addMedicine(id, name, commonName, tradeName, alias, dept->id, price, stock, lowLimit);
         snprintf(out, sizeof(out), "新增药品编号：%s\n结果：%s\n", id, codeText(code));
+        writeAdminLog("新增药品", id, codeText(code));
         openResult(out);
     } else if (choice == 2) {
         listMedicines(out, sizeof(out));
@@ -3149,12 +3615,16 @@ static void manageMedicines(void)
         }
         code = updateMedicine(med->id, price, stock, lowLimit);
         snprintf(out, sizeof(out), "修改药品结果：%s\n", codeText(code));
+        writeAdminLog("修改药品", med->id, codeText(code));
         openResult(out);
     } else {
+        char medicineId[ID_LEN];
         med = chooseMedicine();
         if (med == NULL) return;
+        safeCopy(medicineId, sizeof(medicineId), med->id);
         code = deleteMedicine(med->id);
         snprintf(out, sizeof(out), "删除药品结果：%s\n", codeText(code));
+        writeAdminLog("删除药品", medicineId, codeText(code));
         openResult(out);
     }
 }
@@ -3195,6 +3665,7 @@ static void manageWardBed(void)
         makeNextWardId(id, sizeof(id));
         code = addWard(id, type, dept->id, dailyFee, total, freeBeds);
         snprintf(out, sizeof(out), "新增病房编号：%s\n结果：%s\n", id, codeText(code));
+        writeAdminLog("新增病房", id, codeText(code));
         openResult(out);
     } else if (choice == 2) {
         ward = chooseWardAll();
@@ -3209,6 +3680,7 @@ static void manageWardBed(void)
         makeNextBedId(out, sizeof(out));
         code = addBed(out, ward->id, status, "", "");
         snprintf(resultText, sizeof(resultText), "新增床位编号：%s\n结果：%s\n", out, codeText(code));
+        writeAdminLog("新增床位", out, codeText(code));
         openResult(resultText);
     } else if (choice == 3) {
         listWards(out, sizeof(out));
@@ -3229,14 +3701,116 @@ static void manageWardBed(void)
         }
         code = updateWard(ward->id, dailyFee);
         snprintf(out, sizeof(out), "修改病房结果：%s\n", codeText(code));
+        writeAdminLog("修改病房", ward->id, codeText(code));
         openResult(out);
     } else {
+        char bedId[ID_LEN];
         bed = chooseFreeBed();
         if (bed == NULL) return;
+        safeCopy(bedId, sizeof(bedId), bed->id);
         code = deleteBed(bed->id);
         snprintf(out, sizeof(out), "删除床位结果：%s\n", codeText(code));
+        writeAdminLog("删除床位", bedId, codeText(code));
         openResult(out);
     }
+}
+
+static void showWarningCenter(void)
+{
+    char out[RESULT_LEN];
+    buildWarningReport(out, sizeof(out));
+    writeAdminLog("查看预警中心", "预警中心", "成功");
+    openResult(out);
+}
+
+static void showAdminLogs(void)
+{
+    FILE *fp;
+    char out[RESULT_LEN];
+    char line[LINE_LEN];
+
+    clearText(out, sizeof(out));
+    appendLine(out, sizeof(out), "操作日志");
+    appendLine(out, sizeof(out), "格式：时间 | 管理员 | 操作类型 | 对象 | 结果\n");
+
+    fp = fopen("data\\admin_log.txt", "r");
+    if (fp == NULL) {
+        appendLine(out, sizeof(out), "暂无操作日志。");
+        writeAdminLog("查看操作日志", "admin_log.txt", "成功：暂无日志");
+        openResult(out);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        removeLineEnd(line);
+        appendText(out, sizeof(out), line);
+        appendLine(out, sizeof(out), "");
+    }
+    fclose(fp);
+    writeAdminLog("查看操作日志", "admin_log.txt", "成功");
+    openResult(out);
+}
+
+static void buildBackupList(char *out, int outSize)
+{
+    WIN32_FIND_DATAA data;
+    HANDLE h;
+    int count = 0;
+
+    clearText(out, outSize);
+    appendLine(out, outSize, "备份列表");
+    appendLine(out, outSize, "目录格式：backup/YYYY-MM-DD_HHMMSS\n");
+
+    if (!isDirectoryA("backup")) {
+        appendLine(out, outSize, "暂无备份目录。");
+        return;
+    }
+
+    h = FindFirstFileA("backup\\*", &data);
+    if (h == INVALID_HANDLE_VALUE) {
+        appendLine(out, outSize, "暂无备份目录。");
+        return;
+    }
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            strcmp(data.cFileName, ".") != 0 &&
+            strcmp(data.cFileName, "..") != 0) {
+            char line[LINE_LEN];
+            snprintf(line, sizeof(line), "%d. backup\\%s\n", ++count, data.cFileName);
+            appendText(out, outSize, line);
+        }
+    } while (FindNextFileA(h, &data));
+    FindClose(h);
+
+    if (count == 0) appendLine(out, outSize, "暂无备份目录。");
+}
+
+static void manageBackupRestore(void)
+{
+    int choice;
+    char out[RESULT_LEN];
+    if (!askChoice(L"备份恢复", "1. 手动备份\n2. 恢复最近备份\n3. 查看备份列表", 3, &choice)) return;
+
+    if (choice == 1) {
+        performBackup("手动备份", out, sizeof(out));
+        openResult(out);
+        return;
+    }
+    if (choice == 2) {
+        if (MessageBox(GetHWnd(),
+            L"恢复会用最近备份覆盖当前 data 目录中的业务数据。\n该操作只允许管理员手动触发，确认继续吗？",
+            L"确认恢复最近备份", MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+            writeAdminLog("恢复备份", "backup", "取消");
+            return;
+        }
+        restoreLatestBackup(out, sizeof(out));
+        openResult(out);
+        return;
+    }
+
+    buildBackupList(out, sizeof(out));
+    writeAdminLog("查看备份列表", "backup", "成功");
+    openResult(out);
 }
 
 static void showReports(void)
@@ -3265,6 +3839,7 @@ static void doRunTests(void)
     loadAllData("data", loadMsg, sizeof(loadMsg));
     appendLine(out, sizeof(out), "");
     appendLine(out, sizeof(out), "测试结束后已尝试重新读取 data 文件夹，避免污染演示数据。");
+    writeAdminLog("运行系统测试", "测试数据", "完成");
     openResult(out);
 }
 
@@ -3277,6 +3852,7 @@ static void doSave(void)
     } else {
         appendLine(msg, sizeof(msg), "账号数据保存完成。");
     }
+    writeAdminLog("保存数据", "data", "完成");
     openResult(msg);
 }
 
@@ -3291,6 +3867,7 @@ static void doLoad(void)
     }
     if (currentPatient() == NULL) clearText(loggedPatientId, sizeof(loggedPatientId));
     if (currentDoctor() == NULL) clearText(loggedDoctorId, sizeof(loggedDoctorId));
+    writeAdminLog("读取数据", "data", "完成");
     openResult(msg);
 }
 
@@ -3339,6 +3916,74 @@ static void drawSmallNote(const wchar_t *text)
     useClearFont(22, FW_SEMIBOLD);
     settextcolor(RGB(25, 35, 50));
     outtextxy(74, 150, text);
+}
+
+static void drawMetricCard(int x1, int y1, int x2, int y2, const wchar_t *label, const char *value, COLORREF accent)
+{
+    RECT labelRect = { x1 + 14, y1 + 10, x2 - 14, y1 + 34 };
+    RECT valueRect = { x1 + 14, y1 + 38, x2 - 14, y2 - 10 };
+
+    setfillcolor(RGB(248, 250, 252));
+    setlinecolor(accent);
+    setlinestyle(PS_SOLID, 2);
+    solidrectangle(x1, y1, x2, y2);
+    rectangle(x1, y1, x2, y2);
+
+    useClearFont(17, FW_SEMIBOLD);
+    settextcolor(RGB(82, 92, 105));
+    drawtext(label, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    useClearFont(25, FW_SEMIBOLD);
+    settextcolor(RGB(18, 24, 38));
+    drawtext(toWide(value).c_str(), &valueRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+}
+
+static void drawAdminDashboard(void)
+{
+    DashboardStats stats;
+    WarningStats warnings;
+    char value[64];
+    wchar_t summary[256];
+    RECT warnRect = {70, 238, 990, 298};
+
+    buildDashboardStats(&stats);
+    buildWarningStats(&warnings);
+
+    snprintf(value, sizeof(value), "%.2f 元", stats.totalIncome);
+    drawMetricCard(70, 130, 245, 215, L"总收入", value, RGB(31, 128, 96));
+
+    snprintf(value, sizeof(value), "%d", stats.todayRegisterCount);
+    drawMetricCard(260, 130, 435, 215, L"今日挂号数", value, RGB(37, 99, 235));
+
+    snprintf(value, sizeof(value), "%d", stats.unpaidCount);
+    drawMetricCard(450, 130, 625, 215, L"待缴费数量", value, RGB(217, 119, 6));
+
+    snprintf(value, sizeof(value), "%.1f%%", stats.bedOccupancyRate);
+    drawMetricCard(640, 130, 815, 215, L"住院占床率", value, RGB(126, 34, 206));
+
+    snprintf(value, sizeof(value), "%d", stats.lowStockMedicineCount);
+    drawMetricCard(830, 130, 990, 215, L"低库存药品", value, RGB(190, 18, 60));
+
+    setfillcolor(RGB(255, 251, 235));
+    setlinecolor(RGB(245, 158, 11));
+    setlinestyle(PS_SOLID, 2);
+    solidrectangle(warnRect.left, warnRect.top, warnRect.right, warnRect.bottom);
+    rectangle(warnRect.left, warnRect.top, warnRect.right, warnRect.bottom);
+
+    useClearFont(21, FW_SEMIBOLD);
+    settextcolor(RGB(120, 53, 15));
+    outtextxy(90, 252, L"预警摘要");
+
+    swprintf(summary, 256, L"低库存 %d 项    未缴费 %d 笔    床位紧张 %d 个病房    号源不足 %d 名医生",
+        warnings.lowStockMedicineCount,
+        warnings.unpaidPaymentCount,
+        warnings.bedShortageWardCount,
+        warnings.lowDoctorSlotCount);
+    useClearFont(20, FW_SEMIBOLD);
+    settextcolor(RGB(30, 41, 59));
+    outtextxy(230, 253, summary);
+
+    setlinestyle(PS_SOLID, 1);
 }
 
 static int countResultLines(void)
@@ -3441,16 +4086,19 @@ static void drawPage(void)
         {830, 520, 980, 580, L"返回", 0}
     };
     Button admin[] = {
-        {90, 210, 310, 270, L"患者管理", 30},
-        {420, 210, 640, 270, L"医生管理", 31},
-        {750, 210, 970, 270, L"科室管理", 32},
-        {90, 340, 310, 400, L"药品管理", 33},
-        {420, 340, 640, 400, L"病房床位", 34},
-        {750, 340, 970, 400, L"统计报表", 35},
-        {300, 470, 520, 530, L"系统测试", 36},
-        {540, 470, 700, 530, L"读取", 90},
-        {700, 470, 860, 530, L"保存", 91},
-        {830, 520, 980, 580, L"返回", 0}
+        {65, 325, 225, 375, L"患者管理", 30},
+        {245, 325, 405, 375, L"医生管理", 31},
+        {425, 325, 585, 375, L"科室管理", 32},
+        {605, 325, 765, 375, L"药品管理", 33},
+        {785, 325, 945, 375, L"病房床位", 34},
+        {65, 395, 225, 445, L"详细报表", 35},
+        {245, 395, 405, 445, L"预警中心", 37},
+        {425, 395, 585, 445, L"操作日志", 38},
+        {605, 395, 765, 445, L"备份恢复", 39},
+        {785, 395, 945, 445, L"系统测试", 36},
+        {155, 485, 315, 535, L"读取数据", 90},
+        {450, 485, 610, 535, L"保存数据", 91},
+        {745, 485, 905, 535, L"退出", 0}
     };
     Button patientAuth[] = {
         {300, 230, 500, 295, L"登录", 40},
@@ -3482,9 +4130,9 @@ static void drawPage(void)
         drawSmallNote(L"看诊、检查开单、处方、发药、入院、出院；检查费与药费须先缴费后再继续后续步骤。");
         drawButtons(medical, 7);
     } else if (currentPage == PAGE_ADMIN) {
-        drawTop(L"管理端");
-        drawSmallNote(L"基础数据、统计报表和系统测试都从这里进入。");
-        drawButtons(admin, 10);
+        drawTop(L"管理端治理与运营中心");
+        drawAdminDashboard();
+        drawButtons(admin, 13);
     } else if (currentPage == PAGE_PATIENT_AUTH) {
         drawTop(L"患者端");
         drawSmallNote(L"请先用唯一手机号登录；新患者在注册页一次性填写患者信息。");
@@ -3528,11 +4176,13 @@ static int actionAt(int x, int y)
         {830, 520, 980, 580, L"", 0}
     };
     Button admin[] = {
-        {90, 210, 310, 270, L"", 30}, {420, 210, 640, 270, L"", 31},
-        {750, 210, 970, 270, L"", 32}, {90, 340, 310, 400, L"", 33},
-        {420, 340, 640, 400, L"", 34}, {750, 340, 970, 400, L"", 35},
-        {300, 470, 520, 530, L"", 36}, {540, 470, 700, 530, L"", 90},
-        {700, 470, 860, 530, L"", 91}, {830, 520, 980, 580, L"", 0}
+        {65, 325, 225, 375, L"", 30}, {245, 325, 405, 375, L"", 31},
+        {425, 325, 585, 375, L"", 32}, {605, 325, 765, 375, L"", 33},
+        {785, 325, 945, 375, L"", 34}, {65, 395, 225, 445, L"", 35},
+        {245, 395, 405, 445, L"", 37}, {425, 395, 585, 445, L"", 38},
+        {605, 395, 765, 445, L"", 39}, {785, 395, 945, 445, L"", 36},
+        {155, 485, 315, 535, L"", 90}, {450, 485, 610, 535, L"", 91},
+        {745, 485, 905, 535, L"", 0}
     };
     Button result[] = {
         {250, 500, 370, 550, L"", 101}, {370, 500, 510, 550, L"", 102},
@@ -3550,7 +4200,7 @@ static int actionAt(int x, int y)
     if (currentPage == PAGE_HOME) return hit(home, 3, x, y);
     if (currentPage == PAGE_PATIENT) return hit(patient, 7, x, y);
     if (currentPage == PAGE_MEDICAL) return hit(medical, 7, x, y);
-    if (currentPage == PAGE_ADMIN) return hit(admin, 10, x, y);
+    if (currentPage == PAGE_ADMIN) return hit(admin, 13, x, y);
     if (currentPage == PAGE_PATIENT_AUTH) return hit(patientAuth, 3, x, y);
     if (currentPage == PAGE_DOCTOR_AUTH) return hit(doctorAuth, 3, x, y);
     return hit(result, 5, x, y);
@@ -3559,10 +4209,20 @@ static int actionAt(int x, int y)
 static void handleAction(int action)
 {
     if (action < 0) return;
-    if (action == 0) currentPage = PAGE_HOME;
+    if (action == 0) {
+        if (currentPage == PAGE_ADMIN && adminLoggedIn) {
+            writeAdminLog("管理员退出", "管理端", "成功");
+            adminLoggedIn = 0;
+            clearText(currentAdminName, sizeof(currentAdminName));
+        }
+        currentPage = PAGE_HOME;
+    }
     else if (action == 1) currentPage = loggedPatientId[0] ? PAGE_PATIENT : PAGE_PATIENT_AUTH;
     else if (action == 2) currentPage = loggedDoctorId[0] ? PAGE_MEDICAL : PAGE_DOCTOR_AUTH;
-    else if (action == 3) currentPage = PAGE_ADMIN;
+    else if (action == 3) {
+        if (adminLoggedIn) currentPage = PAGE_ADMIN;
+        else doAdminLogin();
+    }
     else if (action == 10) doAddPatient();
     else if (action == 11) doRegister();
     else if (action == 12) doPatientProfile();
@@ -3586,6 +4246,9 @@ static void handleAction(int action)
     else if (action == 34) manageWardBed();
     else if (action == 35) showReports();
     else if (action == 36) doRunTests();
+    else if (action == 37) showWarningCenter();
+    else if (action == 38) showAdminLogs();
+    else if (action == 39) manageBackupRestore();
     else if (action == 40) doPatientLogin();
     else if (action == 41) doPatientRegister();
     else if (action == 42) doDoctorLogin();
@@ -3619,8 +4282,10 @@ void runGui(void)
     setbkcolor(RGB(248, 250, 252));
     loadAllData("data", resultText, sizeof(resultText));
     loadAuthData("data\\account.txt");
+    checkAutoBackup();
     drawPage();
     while (1) {
+        checkAutoBackup();
         if (MouseHit()) {
             MOUSEMSG msg = GetMouseMsg();
             if (msg.uMsg == WM_LBUTTONDOWN) {
